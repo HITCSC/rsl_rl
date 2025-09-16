@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, Encoder
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -20,6 +20,7 @@ class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
     policy: ActorCritic
+    encoder: Encoder
     """The actor critic module."""
 
     def __init__(
@@ -38,6 +39,7 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        encoder=None,
         normalize_advantage_per_mini_batch=False,
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -94,8 +96,14 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+        
+        self.encoder = encoder
+        self.optimizer = optim.Adam(list(self.policy.parameters()), lr=learning_rate)
+
+        if self.encoder is not None:
+            self.encoder.to(self.device)
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+            self.optimizer = optim.Adam(list(self.encoder.parameters()) + list(self.policy.parameters()), lr=learning_rate)
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -257,6 +265,8 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
+
+            # print(f"obs_batch shape: {obs_batch.shape}")
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
@@ -384,7 +394,7 @@ class PPO:
 
             # Apply the gradients
             # -- For PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:

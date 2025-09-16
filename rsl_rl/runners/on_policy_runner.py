@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
+    Encoder,
 )
 from rsl_rl.utils import store_code_state
 
@@ -33,6 +34,10 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.use_encoder = train_cfg["use_encoder"]
+        self.d = train_cfg["d"]
+        self.h = train_cfg["h"]
+        self.map_size = train_cfg["map_size"]
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -47,7 +52,10 @@ class OnPolicyRunner:
 
         # resolve dimensions of observations
         obs, extras = self.env.get_observations()
+        encoder = None
         num_obs = obs.shape[1]
+
+
 
         # resolve type of privileged observations
         if self.training_type == "rl":
@@ -66,12 +74,21 @@ class OnPolicyRunner:
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
+        
 
+        if self.use_encoder:
+            encoder = Encoder(self.d, self.h, num_obs, self.map_size, 12).to(self.device)
+
+            num_obs = obs.shape[1]
+            num_obs += self.d
+            num_privileged_obs = num_obs
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+
+        # encoder = Encoder(64, 16, 440, (17,11), 12).to(self.device)
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -94,7 +111,7 @@ class OnPolicyRunner:
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
         self.alg: PPO | Distillation = alg_class(
-            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            policy, device=self.device, encoder=encoder, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
         # store training configuration
@@ -167,8 +184,19 @@ class OnPolicyRunner:
 
         # start learning
         obs, extras = self.env.get_observations()
+        if self.use_encoder:
+            map_scans = extras["observations"]["Map"]
+            map_scans = map_scans.to(self.device)
+            map_scans = map_scans.view(map_scans.shape[0], self.map_size[0], self.map_size[1], 3)
+            combined = self.alg.encoder(map_scans, obs)
+            # obs = obs.to(self.device)
+        # print("Observations:", obs)
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+
+        if self.use_encoder:
+            obs = combined.to(self.device)
+            privileged_obs = combined.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -204,8 +232,17 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    if self.use_encoder:
+                        map_scans = infos["observations"]["Map"]
+                        map_scans = map_scans.to(self.device)
+                        map_scans = map_scans.view(map_scans.shape[0], self.map_size[0], self.map_size[1], 3)
+                    # print("obs:", obs.shape)
+                    # print("map_scans:", map_scans.shape)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    if self.use_encoder:
+                        combined = self.alg.encoder(map_scans, obs)
+                        obs = combined.to(self.device)
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -213,6 +250,9 @@ class OnPolicyRunner:
                             infos["observations"][self.privileged_obs_type].to(self.device)
                         )
                     else:
+                        privileged_obs = obs
+                    
+                    if self.use_encoder:
                         privileged_obs = obs
 
                     # process the step
@@ -253,14 +293,21 @@ class OnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
-
+                
+            
                 # compute returns
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
 
             # update policy
             loss_dict = self.alg.update()
-
+            for name ,param in self.alg.encoder.named_parameters():
+                print(f"Name: {name}")
+                print(f"Values: {param.grad}")
+            for name ,param in self.alg.policy.named_parameters():
+                print(f"Name: {name}")
+                print(f"Values: {param.grad}")
+            # print(self.alg.optimizer)
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
