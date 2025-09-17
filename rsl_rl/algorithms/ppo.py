@@ -143,12 +143,17 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, combined=None, map_scans=None):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        if combined is not None:
+            self.transition.actions = self.policy.act(combined).detach()
+            self.transition.values = self.policy.evaluate(combined).detach() 
+            self.transition.map_scans = map_scans.detach()
+        else:           
+            self.transition.actions = self.policy.act(obs).detach()
+            self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -216,6 +221,7 @@ class PPO:
 
         # iterate over batches
         for (
+            map_scans_batch,
             obs_batch,
             critic_obs_batch,
             actions_batch,
@@ -267,10 +273,11 @@ class PPO:
             # -- actor
 
             # print(f"obs_batch shape: {obs_batch.shape}")
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            combined_batch = self.encoder(map_scans_batch, obs_batch)
+            self.policy.act(combined_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(combined_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -394,7 +401,7 @@ class PPO:
 
             # Apply the gradients
             # -- For PPO
-            # nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:

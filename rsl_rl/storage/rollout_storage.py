@@ -25,6 +25,7 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+            self.map_scans = None
 
         def clear(self):
             self.__init__()
@@ -60,6 +61,7 @@ class RolloutStorage:
             self.privileged_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.map_scans = torch.zeros(num_transitions_per_env, num_envs, 17, 11, 3, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # for distillation
@@ -95,6 +97,8 @@ class RolloutStorage:
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.privileged_observations)
+        if transition.map_scans is not None:
+            self.map_scans[self.step].copy_(transition.map_scans)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -198,7 +202,7 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
-
+        map_scans = self.map_scans.flatten(0, 1)
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
@@ -221,7 +225,7 @@ class RolloutStorage:
                 obs_batch = observations[batch_idx]
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
-
+                map_scans_batch = map_scans[batch_idx]
                 # -- For PPO
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -237,7 +241,7 @@ class RolloutStorage:
                     rnd_state_batch = None
 
                 # yield the mini-batch
-                yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield  map_scans_batch, obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
                 ), None, rnd_state_batch

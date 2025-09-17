@@ -80,12 +80,12 @@ class OnPolicyRunner:
             encoder = Encoder(self.d, self.h, num_obs, self.map_size, 12).to(self.device)
 
             num_obs = obs.shape[1]
-            num_obs += self.d
+            # num_obs += self.d
             num_privileged_obs = num_obs
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            num_obs + self.d, num_privileged_obs + self.d, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # encoder = Encoder(64, 16, 440, (17,11), 12).to(self.device)
@@ -184,19 +184,23 @@ class OnPolicyRunner:
 
         # start learning
         obs, extras = self.env.get_observations()
+        combined = None
+        map_scans = None
         if self.use_encoder:
             map_scans = extras["observations"]["Map"]
             map_scans = map_scans.to(self.device)
             map_scans = map_scans.view(map_scans.shape[0], self.map_size[0], self.map_size[1], 3)
             combined = self.alg.encoder(map_scans, obs)
+            combined = combined.to(self.device)
             # obs = obs.to(self.device)
-        # print("Observations:", obs)
+        print("Observations:", obs.shape)
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
-
         if self.use_encoder:
-            obs = combined.to(self.device)
-            privileged_obs = combined.to(self.device)
+            privileged_obs = obs
+        # if self.use_encoder:
+        #     obs = combined.to(self.device)
+        #     privileged_obs = combined.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -229,7 +233,8 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    # print("Obs:", obs.shape, privileged_obs.shape, combined.shape, map_scans.shape)
+                    actions = self.alg.act(obs, privileged_obs, combined=combined, map_scans=map_scans)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     if self.use_encoder:
@@ -242,9 +247,10 @@ class OnPolicyRunner:
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     if self.use_encoder:
                         combined = self.alg.encoder(map_scans, obs)
-                        obs = combined.to(self.device)
+                        # obs = combined.to(self.device)
                     # perform normalization
-                    obs = self.obs_normalizer(obs)
+                    if self.alg.encoder is not None:
+                        obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
                             infos["observations"][self.privileged_obs_type].to(self.device)
@@ -297,7 +303,7 @@ class OnPolicyRunner:
             
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs)
+                    self.alg.compute_returns(combined)
 
             # update policy
             loss_dict = self.alg.update()
