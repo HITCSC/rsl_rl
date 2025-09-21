@@ -5,7 +5,7 @@ runner:
   max_iterations: 1500  # number of policy updates
   seed: 1
   # -- observations
-  obs_groups: {"policy": ["policy"], "critic": ["policy", "privileged"]} # maps observation groups to types. See `vec_env.py` for more information
+  obs_groups: {"policy": ["policy"], "critic": ["policy", "privileged"],"perception":["height_scan"]} # maps observation groups to types. See `vec_env.py` for more information
   # -- logging parameters
   save_interval: 50  # check for potential saves every `save_interval` iterations
   experiment_name: walking_experiment
@@ -17,7 +17,7 @@ runner:
 
   # -- policy
   policy:
-    class_name: ActorCritic
+    class_name: EncActorCritic
     activation: elu
     actor_obs_normalization: false
     critic_obs_normalization: false
@@ -25,6 +25,9 @@ runner:
     critic_hidden_dims: [256, 256, 256]
     init_noise_std: 1.0
     noise_std_type: "scalar"  # 'scalar' or 'log'
+    embedding_dim: 64
+    obs_style: "lab"  # "lab" or "gym"
+    load_mask: 7 
 
   # -- algorithm
   algorithm:
