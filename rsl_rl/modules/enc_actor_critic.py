@@ -90,7 +90,7 @@ class EncActorCritic(nn.Module):
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
+            self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,num_actor_obs))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
@@ -100,7 +100,7 @@ class EncActorCritic(nn.Module):
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)  # 是不是(self.horizon,num_critic_obs)会更好?
+            self.critic_obs_normalizer = EmpiricalNormalization((self.horizon,num_critic_obs))  # 是不是(self.horizon,num_critic_obs)会更好?
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
         print(f"Critic MLP: {self.critic}")
