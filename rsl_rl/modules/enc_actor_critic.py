@@ -12,6 +12,7 @@ class EncActorCritic(nn.Module):
     LOAD_POLICY_WEIGHTS = 1
     LOAD_CRITIC_WEIGHTS = 2
     LOAD_ENCODER_WEIGHTS = 4 
+    LOAD_NORMALIZER_WEIGHTS = 8
 
     def __init__(
         self,
@@ -26,8 +27,8 @@ class EncActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         embedding_dim=64,
-        obs_style='lab',
-        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS,
+        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
+        output_attention:bool=False,
         **kwargs,
     ):
         if kwargs:
@@ -60,12 +61,13 @@ class EncActorCritic(nn.Module):
             # num_perception_obs += obs[obs_group].shape[-1]
             if (obs_group == "perception"):
                 scan_height_shape = obs[obs_group].shape # 
-        self.obs_style = obs_style
         self.embedding_dim = embedding_dim
         self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
         print(f"Encoder : {self.encoder}")
         self.horizon = scan_height_shape[1] 
+        self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
+        self.output_attention = output_attention  # 是否输出attention 
         embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs) # [H*(d_obs+d)]
         embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_c+d)]
         self.embedding_actor_dim = embedding_actor_dim
@@ -88,7 +90,7 @@ class EncActorCritic(nn.Module):
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)  # 这里是支持输入[B,H,d]的
+            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
@@ -98,7 +100,7 @@ class EncActorCritic(nn.Module):
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
+            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)  # 是不是(self.horizon,num_critic_obs)会更好?
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
         print(f"Critic MLP: {self.critic}")
@@ -161,15 +163,15 @@ class EncActorCritic(nn.Module):
         self.update_distribution(low_dim_obs,high_dim_obs)
         return self.distribution.sample()
 
-    def act_inference(self, obs,vis=False):
+    def act_inference(self, obs):
         low_dim_obs,high_dim_obs = self.get_actor_obs(obs)  # [B,H,d]
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs) # [B,H,d]
         # compute embedding 
-        embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=True)
+        embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
-        if (vis):
+        if (self.output_attention):
             return action,attention
         else:
             return action
@@ -304,12 +306,21 @@ class EncActorCritic(nn.Module):
         """
         # 存在的keys : {'std','encoder.*','actor.*','critic.*'}
         if self.load_mask & self.LOAD_POLICY_WEIGHTS:
-            self.actor.load_state_dict(state_dict, strict=strict)
+            actor_state_dict = {k.replace('actor.', '',1): v for k, v in state_dict.items() if k.startswith('actor.')}
+            self.actor.load_state_dict(actor_state_dict, strict=strict)
+            print("=== EncActorCritic : Load Actor Weights ===")
             # TODO : 这里需要确认一下, 是否需要加载std的参数
         if self.load_mask & self.LOAD_CRITIC_WEIGHTS:
-            self.critic.load_state_dict(state_dict, strict=strict)
+            critic_state_dict = {k.replace('critic.', '',1): v for k, v in state_dict.items() if k.startswith('critic.')}
+            self.critic.load_state_dict(critic_state_dict, strict=strict)
+            print("=== EncActorCritic : Load Critic Weights ===")
         if self.load_mask & self.LOAD_ENCODER_WEIGHTS:
-            self.encoder.load_state_dict(state_dict, strict=strict)
-
+            enc_state_dict = {k.replace('encoder.', '',1): v for k, v in state_dict.items() if k.startswith('encoder.')}
+            self.encoder.load_state_dict(enc_state_dict, strict=strict)
+            print("=== EncActorCritic : Load Encoder Weights ===")
+        # 这里应该还需要load normalization的参数?
+        if (self.actor_obs_normalization and self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
+            self.actor_obs_normalizer.load_state_dict(state_dict['actor_obs_normalizer'])
+            print("=== EncActorCritic : Load normalization weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
