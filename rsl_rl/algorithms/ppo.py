@@ -11,6 +11,7 @@ import torch.optim as optim
 from itertools import chain
 
 from rsl_rl.modules import ActorCritic
+from rsl_rl.modules.actor_critic_attention import ActorCriticAttention
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +20,9 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic
+    # policy: ActorCritic
+    """The actor critic module."""
+    policy: ActorCriticAttention
     """The actor critic module."""
 
     def __init__(
@@ -116,7 +119,7 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
+        self, training_type, num_envs, num_transitions_per_env, map_scans_shape, actor_obs_shape, critic_obs_shape, actions_shape
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -128,6 +131,7 @@ class PPO:
             training_type,
             num_envs,
             num_transitions_per_env,
+            map_scans_shape,
             actor_obs_shape,
             critic_obs_shape,
             actions_shape,
@@ -135,16 +139,17 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, map_scans, obs, critic_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        self.transition.actions = self.policy.act(map_scans, obs).detach()
+        self.transition.values = self.policy.evaluate(map_scans, obs, critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
+        self.transition.map_scans = map_scans
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
@@ -178,9 +183,9 @@ class PPO:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self, last_critic_obs):
+    def compute_returns(self, last_map_scans, last_obs, last_critic_obs):
         # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
+        last_values = self.policy.evaluate(last_map_scans, last_obs, last_critic_obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -208,6 +213,7 @@ class PPO:
 
         # iterate over batches
         for (
+            map_scans_batch,
             obs_batch,
             critic_obs_batch,
             actions_batch,
@@ -257,10 +263,10 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(map_scans_batch, obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(map_scans_batch, obs_batch, critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]

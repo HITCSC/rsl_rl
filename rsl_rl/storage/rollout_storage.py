@@ -13,6 +13,7 @@ from rsl_rl.utils import split_and_pad_trajectories
 class RolloutStorage:
     class Transition:
         def __init__(self):
+            self.map_scans = None
             self.observations = None
             self.privileged_observations = None
             self.actions = None
@@ -34,6 +35,7 @@ class RolloutStorage:
         training_type,
         num_envs,
         num_transitions_per_env,
+        map_scans_shape,
         obs_shape,
         privileged_obs_shape,
         actions_shape,
@@ -45,12 +47,14 @@ class RolloutStorage:
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
+        self.map_scans_shape = map_scans_shape
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
 
         # Core
+        self.map_scans = torch.zeros(num_transitions_per_env, num_envs, *map_scans_shape, device=self.device)
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
         if privileged_obs_shape is not None:
             self.privileged_observations = torch.zeros(
@@ -92,6 +96,7 @@ class RolloutStorage:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
+        self.map_scans[self.step].copy_(transition.map_scans)
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.privileged_observations)
@@ -189,6 +194,7 @@ class RolloutStorage:
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
         # Core
+        map_scans = self.map_scans.flatten(0, 1)
         observations = self.observations.flatten(0, 1)
         if self.privileged_observations is not None:
             privileged_observations = self.privileged_observations.flatten(0, 1)
@@ -218,6 +224,7 @@ class RolloutStorage:
 
                 # Create the mini-batch
                 # -- Core
+                map_scans_batch = map_scans[batch_idx]
                 obs_batch = observations[batch_idx]
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
@@ -237,7 +244,7 @@ class RolloutStorage:
                     rnd_state_batch = None
 
                 # yield the mini-batch
-                yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield map_scans_batch, obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
                 ), None, rnd_state_batch

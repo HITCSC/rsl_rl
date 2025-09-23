@@ -16,6 +16,7 @@ from rsl_rl.algorithms import PPO, Distillation
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
+    ActorCriticAttention,
     ActorCriticRecurrent,
     EmpiricalNormalization,
     StudentTeacher,
@@ -33,6 +34,7 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.mha_cfg = train_cfg["mha_cfg"]   # TODO: How to pass this? I can only set it below.
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -67,11 +69,17 @@ class OnPolicyRunner:
         else:
             num_privileged_obs = num_obs
 
+        # resolve dimension of map_scans TODO: NEED TO BE CONFIRMED!!!!!
+        dim_map_scans = extras["observations"]["map_scans"].shape[1:3]  # (187, 3) = (17*11, 3)
+        self.mha_cfg["map_size_storage"] = dim_map_scans
+        # self.mha_cfg["mha_dim"] = 64
+        # self.mha_cfg["mha_heads"] = 16
+
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        policy: ActorCritic | ActorCriticAttention | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+            self.mha_cfg, num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+        ).to(self.device)   # only ActorCriticAttention now
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -115,6 +123,7 @@ class OnPolicyRunner:
             self.training_type,
             self.env.num_envs,
             self.num_steps_per_env,
+            dim_map_scans,
             [num_obs],
             [num_privileged_obs],
             [self.env.num_actions],
@@ -168,7 +177,9 @@ class OnPolicyRunner:
         # start learning
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        height_map_scans = extras["observations"].get("map_scans")
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        height_map_scans = height_map_scans.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -201,7 +212,7 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    actions = self.alg.act(height_map_scans, obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -214,6 +225,7 @@ class OnPolicyRunner:
                         )
                     else:
                         privileged_obs = obs
+                    height_map_scans = infos["observations"]["map_scans"].to(self.device)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -256,7 +268,7 @@ class OnPolicyRunner:
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs)
+                    self.alg.compute_returns(height_map_scans, obs, privileged_obs)
 
             # update policy
             loss_dict = self.alg.update()
@@ -462,7 +474,7 @@ class OnPolicyRunner:
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
+            policy = lambda map_scans, obs: self.alg.policy.act_inference(map_scans=map_scans, observations=self.obs_normalizer(obs))  # noqa: E731
         return policy
 
     def train_mode(self):
