@@ -289,6 +289,15 @@ class EncActorCritic(nn.Module):
             self.critic_obs_normalizer.update(critic_obs)
 
     # for state_dict :
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        module_dict = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
+        if self.actor_obs_normalization:
+            module_dict[prefix + "actor_obs_normalizer"] = self.actor_obs_normalizer.state_dict()
+        if self.critic_obs_normalization:
+            module_dict[prefix + "critic_obs_normalizer"] = self.critic_obs_normalizer.state_dict()
+        return module_dict
+    
+    
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
 
