@@ -297,7 +297,7 @@ class EncActorCritic(nn.Module):
             module_dict[prefix + "critic_obs_normalizer"] = self.critic_obs_normalizer.state_dict()
         return module_dict
     
-    
+
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
 
@@ -328,8 +328,12 @@ class EncActorCritic(nn.Module):
             self.encoder.load_state_dict(enc_state_dict, strict=strict)
             print("=== EncActorCritic : Load Encoder Weights ===")
         # 这里应该还需要load normalization的参数?
-        if (self.actor_obs_normalization and self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
-            self.actor_obs_normalizer.load_state_dict(state_dict['actor_obs_normalizer'])
-            print("=== EncActorCritic : Load normalization weights ===")
+        if (self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
+            if (self.actor_obs_normalization) and ('actor_obs_normalizer' in state_dict):
+                self.actor_obs_normalizer.load_state_dict(state_dict['actor_obs_normalizer'])
+                print("=== EncActorCritic : Load actor normalizer weights ===")
+            if (self.critic_obs_normalization) and ('critic_obs_normalizer' in state_dict):
+                self.critic_obs_normalizer.load_state_dict(state_dict['critic_obs_normalizer'])
+                print("=== EncActorCritic : Load critic normalizer weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
