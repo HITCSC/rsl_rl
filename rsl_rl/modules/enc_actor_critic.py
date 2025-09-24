@@ -291,10 +291,11 @@ class EncActorCritic(nn.Module):
     # for state_dict :
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
         module_dict = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
-        if self.actor_obs_normalization:
-            module_dict[prefix + "actor_obs_normalizer"] = self.actor_obs_normalizer.state_dict()
-        if self.critic_obs_normalization:
-            module_dict[prefix + "critic_obs_normalizer"] = self.critic_obs_normalizer.state_dict()
+        # 不知道为什么, 不能加下面的
+        # if self.actor_obs_normalization:
+        #     module_dict[prefix + "actor_obs_normalizer"] = self.actor_obs_normalizer.state_dict()
+        # if self.critic_obs_normalization:
+        #     module_dict[prefix + "critic_obs_normalizer"] = self.critic_obs_normalizer.state_dict()
         return module_dict
     
 
