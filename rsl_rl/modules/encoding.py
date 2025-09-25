@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import sys
 
 class AttentionBasedMapEncoding(nn.Module):
     def __init__(self, d=64, h=16, d_obs=None, map_size=None):
@@ -48,8 +48,10 @@ class AttentionBasedMapEncoding(nn.Module):
             proprio_embedding: 本体感觉嵌入, 形状为 (batch_size, 1, d)
         """
         # print("map_scans shape: ", map_scans.shape)
-        map_scans = map_scans.reshape(map_scans.shape[0], self.L, self.W, map_scans.shape[2])
-        # print("map_scans shape: ", map_scans.shape)
+        # print("self.W: ", self.W, "self.L: ", self.L)
+        map_scans = map_scans.reshape(map_scans.shape[0], self.W, self.L, map_scans.shape[2])
+        # torch.set_printoptions(threshold=sys.maxsize)
+        # print("map_scans: ", map_scans[0, :, :, :])
         batch_size = map_scans.shape[0]
 
         # 1. 处理地图扫描
@@ -83,8 +85,12 @@ class AttentionBasedMapEncoding(nn.Module):
             key=pointwise_features,
             value=pointwise_features
         )  # (batch_size, 1, d)
+        # print("map_encoding shape: ", map_encoding.shape)
+        # print("attn_weights.shape: ", attn_weights.shape)
+        attn_weights = attn_weights.reshape(batch_size, 1, self.W, self.L)
+        # print("attn_weights: ", attn_weights)
 
-        return map_encoding, proprioception
+        return map_encoding, proprioception, attn_weights
 
 
 class Encoder(nn.Module):
