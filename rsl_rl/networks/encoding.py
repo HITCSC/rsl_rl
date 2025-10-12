@@ -149,6 +149,7 @@ class AttentionMapEncoder(nn.Module):
 
         """
         super(AttentionMapEncoder, self).__init__()
+        # 这里需要对NaN的值进行处理,将其替换为0
 
         # 注意力地图编码模块
         self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h)
@@ -160,6 +161,10 @@ class AttentionMapEncoder(nn.Module):
         :return map_encoding: (B,H,d)
         :return attention: (B,H,L,W)
         """
+        mask = torch.isnan(map_scans)
+        # if (mask.any()):
+        #     print("Warning: NaN values found in map_scans, replacing with 0.")
+        map_scans[mask] = 0.0
         # 获取编码
         map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
         # [B,H,d], [B,H,d_obs], [B,H,L,W]
