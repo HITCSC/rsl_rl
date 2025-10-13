@@ -154,17 +154,15 @@ class AttentionMapEncoder(nn.Module):
         # 注意力地图编码模块
         self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h)
 
-    def forward(self, map_scans, proprioception,embedding_only=False):
+    def forward(self, map_scans, proprioception, embedding_only=False):
         """
         :param map_scans: height scan/high level input, shape (B, H, L, W, 3)
         :param proprioception: 本体感觉, 形状为 (B,H,d_obs)
         :return map_encoding: (B,H,d)
         :return attention: (B,H,L,W)
         """
-        mask = torch.isnan(map_scans)
-        # if (mask.any()):
-        #     print("Warning: NaN values found in map_scans, replacing with 0.")
-        map_scans[mask] = 0.0
+        # ONNX 不支持 torch.isnan，使用 torch.where 替换
+        map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         # 获取编码
         map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
         # [B,H,d], [B,H,d_obs], [B,H,L,W]

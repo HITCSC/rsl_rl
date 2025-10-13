@@ -328,13 +328,17 @@ class EncActorCritic(nn.Module):
             enc_state_dict = {k.replace('encoder.', '',1): v for k, v in state_dict.items() if k.startswith('encoder.')}
             self.encoder.load_state_dict(enc_state_dict, strict=strict)
             print("=== EncActorCritic : Load Encoder Weights ===")
-        # 这里应该还需要load normalization的参数?
+        # 这里还需要load normalization的参数
         if (self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
-            if (self.actor_obs_normalization) and ('actor_obs_normalizer' in state_dict):
-                self.actor_obs_normalizer.load_state_dict(state_dict['actor_obs_normalizer'])
+            # if (self.actor_obs_normalization) and ('actor_obs_normalizer' in state_dict):
+            if (self.actor_obs_normalization):
+                act_obs_norm_state_dict = {k.replace('actor_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('actor_obs_normalizer.')}
+                self.actor_obs_normalizer.load_state_dict(act_obs_norm_state_dict)
                 print("=== EncActorCritic : Load actor normalizer weights ===")
-            if (self.critic_obs_normalization) and ('critic_obs_normalizer' in state_dict):
-                self.critic_obs_normalizer.load_state_dict(state_dict['critic_obs_normalizer'])
+            # if (self.critic_obs_normalization) and ('critic_obs_normalizer' in state_dict):
+            if (self.critic_obs_normalization):
+                critic_obs_norm_state_dict = {k.replace('critic_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('critic_obs_normalizer.')}
+                self.critic_obs_normalizer.load_state_dict(critic_obs_norm_state_dict)
                 print("=== EncActorCritic : Load critic normalizer weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
