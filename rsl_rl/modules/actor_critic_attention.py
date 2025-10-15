@@ -48,6 +48,7 @@ class ActorAttention(nn.Module):
         self.actor_mlp = nn.Sequential(*actor_layers)
 
     def forward(self, map_scans, observations):
+        map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         map_encoding, _, _ = self.encoder(map_scans, observations)
         # 拼接地图编码和原始本体感觉
         combined = torch.cat([map_encoding.squeeze(1), observations], dim=-1)  # (batch_size, d + d_obs)
@@ -91,6 +92,7 @@ class CriticAttention(nn.Module):
         self.critic_mlp = nn.Sequential(*critic_layers)
 
     def forward(self, map_scans, observations, critic_observations):
+        map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         map_encoding, _, _ = self.encoder(map_scans, observations)
         # 拼接地图编码和critic_observations
         combined = torch.cat([map_encoding.squeeze(1), critic_observations], dim=-1)  # (batch_size, d + d_critic_obs)
