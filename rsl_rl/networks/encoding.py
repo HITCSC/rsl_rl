@@ -74,8 +74,11 @@ class AttentionEncoderBlock(nn.Module):
         # )
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=5, padding=2),  # 保持空间维度不变
+            nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.Conv2d(16, (self.embedding_dim - 3), kernel_size=5, padding=2),  # 保持空间维度不变
+            # nn.BatchNorm2d(self.embedding_dim - 3),
+            # nn.ReLU(),
         )
 
         # 本体感觉嵌入的线性层

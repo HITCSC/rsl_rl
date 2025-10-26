@@ -180,7 +180,8 @@ class EncActorCritic(nn.Module):
         low_dim_obs,high_dim_obs = self.get_critic_obs(obs)  # [B,H,d]
         low_dim_obs = self.critic_obs_normalizer(low_dim_obs)
         # TODO : 这里需要针对(B,H*d)的情况进行处理
-        low_dim_query = low_dim_obs[:,:,self.critic_to_actor_mask]  # [B,H,d] for attention query
+        low_dim_query = low_dim_obs # [B,H,d] 假设是一样的，只不过不带噪声
+        # low_dim_query = low_dim_obs[:,:,self.critic_to_actor_mask]  # [B,H,d] for attention query
         embedding,_ = self.encoder(high_dim_obs,low_dim_query,embedding_only=True)
         critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
         critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
