@@ -73,13 +73,13 @@ class EncActorCritic(nn.Module):
         self.embedding_actor_dim = embedding_actor_dim
         self.embedding_critic_dim = embedding_critic_dim 
         # 这里需要构造一个从critic到actor obs的mask, 但是当前仍然只支持1d的输入
-        critic_to_actor_mask = torch.zeros((num_critic_obs,), dtype=torch.bool)
-        tensor_idx = 0
-        for i, obs_group in enumerate(obs_groups["critic"]):
-            if obs_group in obs_groups["policy"]:
-                critic_to_actor_mask[tensor_idx: tensor_idx + obs[obs_group].shape[-1]] = True
-            tensor_idx += obs[obs_group].shape[-1]
-        self.critic_to_actor_mask = critic_to_actor_mask
+        # critic_to_actor_mask = torch.zeros((num_critic_obs,), dtype=torch.bool)
+        # tensor_idx = 0
+        # for i, obs_group in enumerate(obs_groups["critic"]):
+        #     if obs_group in obs_groups["policy"]:
+        #         critic_to_actor_mask[tensor_idx: tensor_idx + obs[obs_group].shape[-1]] = True
+        #     tensor_idx += obs[obs_group].shape[-1]
+        # self.critic_to_actor_mask = critic_to_actor_mask
         # convert to [B,H,d] style (if obs shape = (B,H*d)) 
         # if (obs_style=='lab'):
         #     self.critic_to_actor_mask = self._lab_to_gym(critic_to_actor_mask,self.horizon,keep_dim=False)
