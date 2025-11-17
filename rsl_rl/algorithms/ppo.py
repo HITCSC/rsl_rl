@@ -448,6 +448,7 @@ class PPO:
             if mean_velocity_loss < 0.5 :
                 self.cnt += 1
                 if self.cnt > 10:
+                    print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
                     self.use_estimated_vel = True
             else:
                 self.cnt = 0

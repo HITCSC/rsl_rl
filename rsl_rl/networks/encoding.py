@@ -149,7 +149,7 @@ class AttentionEncoderBlock(nn.Module):
         history_map_enc = map_encoding.view(B,H,self.embedding_dim)
         history_attn_weights = attn_weights.view(B,H,L,W)
         if self.velocity_estimation_enabled:
-            return history_map_enc,proprioception,history_attn_weights,proprio_embedding[...,  -3:].squeeze(1)
+            return history_map_enc,proprioception[...,-1,...],history_attn_weights,proprio_embedding[...,  -3:].squeeze(1)
         else:
             return history_map_enc,proprioception,history_attn_weights
 
