@@ -49,6 +49,7 @@ class AttentionBasedMapEncoding(nn.Module):
         """
         # print("map_scans shape: ", map_scans.shape)
         # print("self.W: ", self.W, "self.L: ", self.L)
+        torch.where(torch.isnan(map_scans),torch.zeros_like(map_scans),map_scans)
         map_scans = map_scans.reshape(map_scans.shape[0], self.W, self.L, map_scans.shape[2])
         # torch.set_printoptions(threshold=sys.maxsize)
         # print("map_scans: ", map_scans[0, :, :, :])
@@ -116,6 +117,7 @@ class Encoder(nn.Module):
 
     def forward(self, map_scans, proprioception):
         # 获取编码
+        map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         map_encoding, proprioception = self.encoder(map_scans, proprioception)
 
         # 拼接地图编码和原始本体感觉

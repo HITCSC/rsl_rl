@@ -203,6 +203,7 @@ class ActorCriticAttention(nn.Module):
 
     def update_distribution(self, map_scans, observations):
         # compute mean
+        map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         mean = self.actor(map_scans, observations)
         # compute standard deviation
         if self.noise_std_type == "scalar":
