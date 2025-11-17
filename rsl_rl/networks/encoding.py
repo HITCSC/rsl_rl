@@ -53,7 +53,7 @@ class SharedConv2d(nn.Module):
         return output
 
 class AttentionEncoderBlock(nn.Module):
-    def __init__(self, d_obs:int,embedding_dim=64, h=16):
+    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
         :param d: MHA模块的维度 (默认64)
@@ -64,6 +64,7 @@ class AttentionEncoderBlock(nn.Module):
 
         self.embedding_dim = embedding_dim
         self.h = h
+        self.velocity_estimation_enabled = velocity_estimation_enabled
         # self.L, self.W = map_size
 
         # CNN用于处理高度图 (z值)
@@ -80,9 +81,19 @@ class AttentionEncoderBlock(nn.Module):
             # nn.BatchNorm2d(self.embedding_dim - 3),
             # nn.ReLU(),
         )
-
-        # 本体感觉嵌入的线性层
-        self.proprio_linear = nn.Linear(d_obs, embedding_dim) # 这里只对最后一个维度的向量进行操作, output shape (B,H,d)
+        if self.velocity_estimation_enabled:
+            # print("Velocity Estimation Enabled in Attention Encoder Block")
+            self.proprio_linear = nn.Sequential(
+                nn.Linear(d_obs, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, embedding_dim),
+            )
+        else:
+            # 本体感觉嵌入的线性层
+            self.proprio_linear = nn.Linear(d_obs, embedding_dim) 
+        
 
         # 多头注意力模块
         self.mha = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=h, batch_first=True)
@@ -137,15 +148,17 @@ class AttentionEncoderBlock(nn.Module):
         # reshape to (B, H, d) & (B, H, L,W)
         history_map_enc = map_encoding.view(B,H,self.embedding_dim)
         history_attn_weights = attn_weights.view(B,H,L,W)
-
-        return history_map_enc,proprioception,history_attn_weights
+        if self.velocity_estimation_enabled:
+            return history_map_enc,proprioception,history_attn_weights,proprio_embedding[...,  -3:].squeeze(1)
+        else:
+            return history_map_enc,proprioception,history_attn_weights
 
 class AttentionMapEncoder(nn.Module):
     """
     完整的策略网络,包含编码器和后续MLP
     """
 
-    def __init__(self, d_obs, embedding_dim=64, h=16):
+    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
         """
         :param d_obs: 本体感知向量的维度(单次观测)
         :param d: 编码维度
@@ -155,7 +168,7 @@ class AttentionMapEncoder(nn.Module):
         # 这里需要对NaN的值进行处理,将其替换为0
 
         # 注意力地图编码模块
-        self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h)
+        self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h,velocity_estimation_enabled)
 
     def forward(self, map_scans, proprioception, embedding_only=False):
         """
@@ -167,13 +180,19 @@ class AttentionMapEncoder(nn.Module):
         # ONNX 不支持 torch.isnan，使用 torch.where 替换
         map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
         # 获取编码
-        map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
+        if self.encoder.velocity_estimation_enabled:
+            map_encoding, proprioception, attention, estimated_velocity = self.encoder(map_scans, proprioception)
+        else:
+            map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
         # [B,H,d], [B,H,d_obs], [B,H,L,W]
         # 拼接地图编码和原始本体感觉
         if (embedding_only):
             return map_encoding,attention
         else:
-            combined = torch.cat([map_encoding, proprioception], dim=-1)  # (B, H, d + d_obs)
+            if self.encoder.velocity_estimation_enabled:
+                combined = torch.cat([map_encoding, proprioception, estimated_velocity], dim=-1)  # (B, d + d_obs + vel_dim)
+            else:
+                combined = torch.cat([map_encoding, proprioception], dim=-1)  # (B, H, d + d_obs)
             return combined, attention
 
 
@@ -184,7 +203,7 @@ if __name__ == "__main__":
     map_size = (26, 16)  # ANYmal-D的地图尺寸
     horizon = 2
     # 创建模型
-    model = AttentionMapEncoder(d_obs,d, h)
+    model = AttentionMapEncoder(d_obs,d, h,True)
 
     # 创建示例输入
     batch_size = 4

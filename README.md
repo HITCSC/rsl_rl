@@ -115,3 +115,9 @@ If you use the library with symmetry augmentation, please cite:
   doi={10.1109/ICRA57147.2024.10611493}
 }
 ```
+
+
+TODO 
+1.找到obs_batch 对应的真实速度slice
+2.验证估计速度的准确性——从embedding中提出速度。
+2.如何把网络估计的速度融入到policy_obs中

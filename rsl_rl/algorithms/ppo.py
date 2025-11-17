@@ -39,6 +39,11 @@ class PPO:
         desired_kl=0.01,
         device="cpu",
         normalize_advantage_per_mini_batch=False,
+        # TODO velocity estimation
+        velocity_estimation_enabled: bool = False,
+        velocity_loss_coef=0.0,
+        use_estimated_vel:bool = False,
+        cnt = 0,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -114,6 +119,8 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.velocity_estimation_enabled = velocity_estimation_enabled
+        self.velocity_loss_coef = velocity_loss_coef
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
@@ -190,6 +197,11 @@ class PPO:
         else:
             mean_symmetry_loss = None
 
+        if self.velocity_estimation_enabled:
+            mean_velocity_loss = 0
+        else:
+            mean_velocity_loss = None
+
         # generator for mini batches
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -246,6 +258,8 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
+            if self.use_estimated_vel:
+                obs_batch["policy.base_lin_vel"] = self.policy.get_velocity_estimation()
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
@@ -347,6 +361,16 @@ class PPO:
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
+            # velocity estimation loss
+            if self.velocity_estimation_enabled:
+                # compute the velocity
+                velocity_network = self.policy.get_velocity_estimation()
+                # compute the loss
+                vel_mse_loss = torch.nn.MSELoss()
+                # TODO obs_batch 对应的真实速度标签需要确认
+                velocity_loss = vel_mse_loss(velocity_network, obs_batch["privileged.base_lin_vel"].detach())
+                loss += self.velocity_loss_coef * velocity_loss
+                mean_velocity_loss += velocity_loss.item()
             # Random Network Distillation loss
             # TODO: Move this processing to inside RND module.
             if self.rnd:
@@ -418,7 +442,16 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-
+        if self.velocity_estimation_enabled:
+            mean_velocity_loss /= num_updates
+            # TODO 判断何时使用估计速度作为观测速度
+            if mean_velocity_loss < 0.5 :
+                self.cnt += 1
+                if self.cnt > 10:
+                    self.use_estimated_vel = True
+            else:
+                self.cnt = 0
+            loss_dict["velocity_loss"] = mean_velocity_loss
         return loss_dict
 
     """

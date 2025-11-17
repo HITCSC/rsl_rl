@@ -27,6 +27,7 @@ class EncActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         embedding_dim=64,
+        velocity_estimation_enabled: bool = False,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
         **kwargs,
@@ -52,6 +53,7 @@ class EncActorCritic(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
+        self.velocity_estimation_enabled = velocity_estimation_enabled
 
         # Encoder :
         # num_perception_obs = 0
@@ -62,8 +64,14 @@ class EncActorCritic(nn.Module):
             if (obs_group == "perception"):
                 scan_height_shape = obs[obs_group].shape # 
         self.embedding_dim = embedding_dim
-        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
+
+        if self.velocity_estimation_enabled:
+            self.last_estimated_velocity: torch.Tensor = None
+
+
+        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
         print(f"Encoder : {self.encoder}")
+
         self.horizon = scan_height_shape[1] 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
@@ -85,6 +93,11 @@ class EncActorCritic(nn.Module):
         #     self.critic_to_actor_mask = self._lab_to_gym(critic_to_actor_mask,self.horizon,keep_dim=False)
         # else:
         #     self.critic_to_actor_mask = critic_to_actor_mask.reshape(self.horizon,-1)
+        
+        # TODO mlp input din
+        if self.velocity_estimation_enabled:
+            embedding_actor_dim += 3
+
         # actor
         self.actor = MLP(embedding_actor_dim, num_actions, actor_hidden_dims, activation)
         # actor observation normalization
@@ -144,6 +157,8 @@ class EncActorCritic(nn.Module):
         """
         # compute embedding 
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
+        if self.velocity_estimation_enabled:
+            self.last_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)]
         # compute mean
         mean = self.actor(embedding_vec)
@@ -168,6 +183,8 @@ class EncActorCritic(nn.Module):
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs) # [B,H,d]
         # compute embedding 
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
+        if self.velocity_estimation_enabled:
+            self.last_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
@@ -343,3 +360,8 @@ class EncActorCritic(nn.Module):
                 print("=== EncActorCritic : Load critic normalizer weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
+    def get_velocity_estimation(self)->torch.Tensor:
+        if self.velocity_estimation_enabled and self.last_estimated_velocity is not None:
+            return self.last_estimated_velocity
+        else:
+            return None
