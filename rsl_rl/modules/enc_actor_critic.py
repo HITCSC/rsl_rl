@@ -53,7 +53,7 @@ class EncActorCritic(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
-        self.velocity_estimation_enabled = velocity_estimation_enabled
+        self.velocity_estimation_enabled = True
 
         # Encoder :
         # num_perception_obs = 0

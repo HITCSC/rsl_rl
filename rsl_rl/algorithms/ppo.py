@@ -40,8 +40,8 @@ class PPO:
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
-        velocity_estimation_enabled: bool = False,
-        velocity_loss_coef=0.0,
+        velocity_estimation_enabled: bool = True,
+        velocity_loss_coef=0.5,
         use_estimated_vel:bool = False,
         cnt = 0,
         # RND parameters

@@ -53,7 +53,7 @@ class SharedConv2d(nn.Module):
         return output
 
 class AttentionEncoderBlock(nn.Module):
-    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
+    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
         :param d: MHA模块的维度 (默认64)
@@ -65,6 +65,7 @@ class AttentionEncoderBlock(nn.Module):
         self.embedding_dim = embedding_dim
         self.h = h
         self.velocity_estimation_enabled = velocity_estimation_enabled
+        print(f"Attention Encoder Block: embedding_dim={embedding_dim}, h={h}, velocity_estimation_enabled={velocity_estimation_enabled}")
         # self.L, self.W = map_size
 
         # CNN用于处理高度图 (z值)
@@ -82,6 +83,7 @@ class AttentionEncoderBlock(nn.Module):
             # nn.ReLU(),
         )
         if self.velocity_estimation_enabled:
+            print("Velocity Estimation Enabled in Attention Encoder Block!!!!!")
             # print("Velocity Estimation Enabled in Attention Encoder Block")
             self.proprio_linear = nn.Sequential(
                 nn.Linear(d_obs, 256),
@@ -91,6 +93,7 @@ class AttentionEncoderBlock(nn.Module):
                 nn.Linear(128, embedding_dim),
             )
         else:
+            print("Velocity Estimation Disabled in Attention Encoder Block")
             # 本体感觉嵌入的线性层
             self.proprio_linear = nn.Linear(d_obs, embedding_dim) 
         
@@ -160,7 +163,7 @@ class AttentionMapEncoder(nn.Module):
     完整的策略网络,包含编码器和后续MLP
     """
 
-    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
+    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
         """
         :param d_obs: 本体感知向量的维度(单次观测)
         :param d: 编码维度
@@ -168,7 +171,7 @@ class AttentionMapEncoder(nn.Module):
         """
         super(AttentionMapEncoder, self).__init__()
         # 这里需要对NaN的值进行处理,将其替换为0
-
+        print ("velocity_estimation_enabled:",velocity_estimation_enabled)
         # 注意力地图编码模块
         self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h,velocity_estimation_enabled)
 
