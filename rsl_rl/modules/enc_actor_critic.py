@@ -183,6 +183,7 @@ class EncActorCritic(nn.Module):
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs) # [B,H,d]
         # compute embedding 
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
+        print("embedding dim: ", embedding.shape)
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
@@ -270,6 +271,7 @@ class EncActorCritic(nn.Module):
             #     B = obs[obs_group].shape[0]
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
+        # TODO append在最后一个维度，不是b,h,d
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:

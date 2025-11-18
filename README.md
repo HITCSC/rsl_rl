@@ -117,7 +117,8 @@ If you use the library with symmetry augmentation, please cite:
 ```
 
 
-TODO 
-1.找到obs_batch 对应的真实速度slice
-2.验证估计速度的准确性——从embedding中提出速度。
-2.如何把网络估计的速度融入到policy_obs中
+## 11.18解决：
+修复了low_dim_obs数据输入的bug；base_lin_vel提取的错误
+## 11.18问题：
+1. get_actor_obs存在问题：使用append——导致并非 b,h,d 而是history在d上重叠。得重写 ——目前简单地在encoding.py中强行剪切obs
+2. 如何合理地把网络估计速度加入policy_obs有待商榷
