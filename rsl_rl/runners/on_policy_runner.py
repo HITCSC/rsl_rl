@@ -37,7 +37,7 @@ class OnPolicyRunner:
         self.save_interval = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
-        obs = self.env.get_observations()
+        obs = self.env.get_observations() #[envs,history_len,obs_dim]
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")

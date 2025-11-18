@@ -106,6 +106,7 @@ class AttentionEncoderBlock(nn.Module):
         :return: proprio_embedding: proprioception embedding, shape (B, H, embedding_dim)
         :return: attn_weights: attention weights, shape (B, H, L, W)
         """
+        # TODO map_scans的H使用prop的，何意味
         B = map_scans.shape[0]
         H = proprioception.shape[1]
         L = map_scans.shape[2]

@@ -367,8 +367,7 @@ class PPO:
                 velocity_network = self.policy.get_velocity_estimation()
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
-                # TODO obs_batch 对应的真实速度标签需要确认
-                velocity_loss = vel_mse_loss(velocity_network, obs_batch["privileged.base_lin_vel"].detach())
+                velocity_loss = vel_mse_loss(velocity_network, obs_batch["privileged.base_lin_vel"][:,-1].detach())
                 loss += self.velocity_loss_coef * velocity_loss
                 mean_velocity_loss += velocity_loss.item()
             # Random Network Distillation loss

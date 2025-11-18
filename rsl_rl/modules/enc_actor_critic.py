@@ -94,7 +94,7 @@ class EncActorCritic(nn.Module):
         # else:
         #     self.critic_to_actor_mask = critic_to_actor_mask.reshape(self.horizon,-1)
         
-        # TODO mlp input din
+        # TODO mlp input dim
         if self.velocity_estimation_enabled:
             embedding_actor_dim += 3
 
@@ -158,7 +158,7 @@ class EncActorCritic(nn.Module):
         # compute embedding 
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
         if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-3:]  # [B,H,3]
+            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)]
         # compute mean
         mean = self.actor(embedding_vec)
@@ -184,7 +184,7 @@ class EncActorCritic(nn.Module):
         # compute embedding 
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
         if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-3:]  # [B,H,3]
+            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
