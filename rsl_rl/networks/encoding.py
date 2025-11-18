@@ -114,7 +114,7 @@ class AttentionEncoderBlock(nn.Module):
         W = map_scans.shape[3]
         high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
         low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
-        print("low_dim_obs shape:", low_dim_obs.shape)
+        # print("low_dim_obs shape:", low_dim_obs.shape)
         # low_dim_obs = low_dim_obs[..., :91]
         # print("low_dim_obs shape inside encoder:",low_dim_obs.shape)
 

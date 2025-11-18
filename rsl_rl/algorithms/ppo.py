@@ -371,7 +371,9 @@ class PPO:
                 vel_mse_loss = torch.nn.MSELoss()
                 # obs_batch (B,H,D_obs)
                 privileged_obs = obs_batch['privileged']  
+                # Q: base_lin_vel_last_time存在nan？
                 # print("obs_batch shape inside PPO update:",obs_batch['privileged'].shape)
+                # [b,h,d]
                 base_lin_vel_last_time = privileged_obs[...,-1,:3]  
                 # print("privileged_obs shape:", privileged_obs.shape)
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
