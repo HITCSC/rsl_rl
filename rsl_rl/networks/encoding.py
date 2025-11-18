@@ -146,11 +146,12 @@ class AttentionEncoderBlock(nn.Module):
             value=pointwise_features
         )  # (B*H, 1, d) & (B*H, 1, L*W)
 
-        # reshape to (B, H, d) & (B, H, L,W)
+        # reshape to (B,H,d) & (B, H, d) & (B, H, L,W)
+        history_proprio_embedding = proprio_embedding.view(B,H,self.embedding_dim)
         history_map_enc = map_encoding.view(B,H,self.embedding_dim)
         history_attn_weights = attn_weights.view(B,H,L,W)
         if self.velocity_estimation_enabled:
-            return history_map_enc,proprioception[...,-1,...],history_attn_weights,proprio_embedding[...,  -3:].squeeze(1)
+            return history_map_enc,proprioception,history_attn_weights,history_proprio_embedding[..., -1, -3:].squeeze(1)
         else:
             return history_map_enc,proprioception,history_attn_weights
 
@@ -191,7 +192,7 @@ class AttentionMapEncoder(nn.Module):
             return map_encoding,attention
         else:
             if self.encoder.velocity_estimation_enabled:
-                combined = torch.cat([map_encoding, proprioception, estimated_velocity], dim=-1)  # (B, d + d_obs + vel_dim)
+                combined = torch.cat([map_encoding, proprioception, estimated_velocity], dim=-1)  # (B, H ,d + d_obs + vel_dim)
             else:
                 combined = torch.cat([map_encoding, proprioception], dim=-1)  # (B, H, d + d_obs)
             return combined, attention
