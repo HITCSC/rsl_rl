@@ -40,9 +40,8 @@ class PPO:
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
-        velocity_estimation_enabled: bool = False,
-        velocity_loss_coef=0.0,
-        use_estimated_vel:bool = False,
+        velocity_estimation_enabled: bool = True,
+        velocity_loss_coef=0.5,
         cnt = 0,
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -52,6 +51,8 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
     ):
         # device-related parameters
+        self.cnt = cnt
+        self.use_estimated_vel = False
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
@@ -258,8 +259,9 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            if self.use_estimated_vel:
-                obs_batch["policy.base_lin_vel"] = self.policy.get_velocity_estimation()
+            # TODO 考虑如何合理地加入到policy_obs中
+            # if self.use_estimated_vel:
+            #     obs_batch["policy.base_lin_vel"] = self.policy.get_velocity_estimation()
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
@@ -367,7 +369,14 @@ class PPO:
                 velocity_network = self.policy.get_velocity_estimation()
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
-                velocity_loss = vel_mse_loss(velocity_network, obs_batch["privileged.base_lin_vel"][:,-1].detach())
+                # obs_batch (B,H,D_obs)
+                privileged_obs = obs_batch['privileged']  
+                # Q: base_lin_vel_last_time存在nan？
+                # print("obs_batch shape inside PPO update:",obs_batch['privileged'].shape)
+                # [b,h,d]
+                base_lin_vel_last_time = privileged_obs[...,-1,:3]  
+                # print("privileged_obs shape:", privileged_obs.shape)
+                velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
                 loss += self.velocity_loss_coef * velocity_loss
                 mean_velocity_loss += velocity_loss.item()
             # Random Network Distillation loss

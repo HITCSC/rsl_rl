@@ -27,7 +27,7 @@ class EncActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         embedding_dim=64,
-        velocity_estimation_enabled: bool = False,
+        velocity_estimation_enabled: bool = True,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
         **kwargs,
@@ -71,12 +71,16 @@ class EncActorCritic(nn.Module):
 
         self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
         print(f"Encoder : {self.encoder}")
-
+        # 这里obs为[512]
         self.horizon = scan_height_shape[1] 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
         self.output_attention = output_attention  # 是否输出attention 
-        embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs) # [H*(d_obs+d)]
+        if self.velocity_estimation_enabled:
+            embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs + 3)
+        else:
+            embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
+
         embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_c+d)]
         self.embedding_actor_dim = embedding_actor_dim
         self.embedding_critic_dim = embedding_critic_dim 
@@ -93,12 +97,12 @@ class EncActorCritic(nn.Module):
         #     self.critic_to_actor_mask = self._lab_to_gym(critic_to_actor_mask,self.horizon,keep_dim=False)
         # else:
         #     self.critic_to_actor_mask = critic_to_actor_mask.reshape(self.horizon,-1)
-        
-        # TODO mlp input dim
-        if self.velocity_estimation_enabled:
-            embedding_actor_dim += 3
+
 
         # actor
+        # 155 * 3 = 465    465+ 9 = 474 
+        print("embedding_actor:",embedding_actor_dim)
+        print("num_action",num_actions)
         self.actor = MLP(embedding_actor_dim, num_actions, actor_hidden_dims, activation)
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -183,6 +187,7 @@ class EncActorCritic(nn.Module):
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs) # [B,H,d]
         # compute embedding 
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
+        print("embedding dim: ", embedding.shape)
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
@@ -270,6 +275,7 @@ class EncActorCritic(nn.Module):
             #     B = obs[obs_group].shape[0]
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
+        # TODO append在最后一个维度，不是b,h,d
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:

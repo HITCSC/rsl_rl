@@ -1,0 +1,130 @@
+def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
+        """
+        :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
+        :param style : 'lab' or 'gym', for lab style obs the permutation is 
+            [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
+            for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
+        :return : tuple of TensorDict, each element shape is [B,H,d,...]
+        """
+        obs_list = []
+        for obs_group in self.obs_groups["policy"]:
+            # 这里假设每个group的历史堆叠形式是gym style的
+            # if style == 'lab':
+            #     gym_obs = self._lab_to_gym(obs[obs_group], self.horizon,keep_dim=False)  # [B,H,d]
+            #     obs_list.append(gym_obs)
+            # else:
+            #     B = obs[obs_group].shape[0]
+            #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
+            obs_list.append(obs[obs_group]) # [B,H,d_i]
+        low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
+        high_dim_obs_list = []
+        for obs_group in self.obs_groups["perception"]:
+            high_dim_obs_list.append(obs[obs_group])
+        high_dim_obs = torch.cat(high_dim_obs_list, dim=-1)  
+        return low_dim_obs,high_dim_obs
+分析代码，有没有可能是这段代码导致的错误
+这段代码是导致 low_dim_obs 特征数时而 88 时而 176 的核心原因！问题出在注释导致的观测格式处理缺失，以及未强制统一观测维度，具体分析和修复如下：
+一、核心错误分析
+这段函数的目标是将多个观测组（obs_group）拼接为统一格式的 low_dim_obs（[B, H, d]），但当前代码存在 2 个致命问题：
+1. 注释导致的维度处理缺失（最关键）
+原本的代码有逻辑：将输入的观测统一转换为 [B, H, d_i] 格式（无论输入是 [B, H*d_i] 还是 [B, H, d_i]）。但现在这段处理逻辑被注释掉了，直接 append(obs[obs_group])，导致：
+
+    如果输入 obs[obs_group] 是 展平格式 [B, H*d_i]（历史维度 H 和特征维度 d_i 合并），直接拼接后，特征数会变成 sum(H*d_i)（而非 sum(d_i)）。
+    如果输入 obs[obs_group] 是 三维格式 [B, H, d_i]，拼接后特征数是 sum(d_i)（正确）。
+
+举个具体例子（对应你的 88/176 波动）：
+
+    假设 obs_groups["policy"] 有 2 个观测组，每个组的真实特征数 d_i=44，历史长度 H=2。
+        情况 1：输入 obs[obs_group] 是 [B, H, d_i]（[B,2,44]）→ 拼接后 d=44+44=88（正确）。
+        情况 2：输入 obs[obs_group] 是 [B, H*d_i]（[B,88]）→ 拼接后 d=88+88=176（错误）。
+    这直接导致 low_dim_obs 的特征数时而 88、时而 176，完全匹配你遇到的问题！
+
+2. 观测格式未强制统一
+函数注释明确说明：输入 obs 的元素形状可能是 [B,H*d] 或 [B,H,d,...]，但当前代码没有任何格式校验和转换，导致：
+
+    不同观测组的格式不一致（有的展平、有的三维）。
+    拼接时 dim=-1 的含义混乱（展平格式的 dim=-1 是 H*d_i，三维格式的 dim=-1 是 d_i）。
+
+二、修复方案（恢复并完善维度处理逻辑）
+核心思路：强制将每个观测组的格式统一为 [B, H, d_i]，再拼接特征维度，确保 low_dim_obs 的特征数始终固定（比如 88）。
+修复后的代码如下：
+python
+运行
+
+def get_actor_obs(self, obs: TensorDict, style: str = 'lab') -> tuple:
+    """
+    :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
+    :param style : 'lab' or 'gym', for lab style obs the permutation is 
+        [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
+        for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
+    :return : tuple of TensorDict, each element shape is [B,H,d,...]
+    """
+    obs_list = []
+    B = None  # 记录batch_size，确保所有观测组的batch一致
+    for obs_group in self.obs_groups["policy"]:
+        obs_tensor = obs[obs_group]
+        if B is None:
+            B = obs_tensor.shape[0]  # 从第一个观测组获取batch_size
+        
+        # 关键修复：强制将每个观测组转换为 [B, H, d_i] 格式
+        if len(obs_tensor.shape) == 2:
+            # 输入是 [B, H*d_i]（展平格式）→ reshape 为 [B, H, d_i]
+            d_i = obs_tensor.shape[1] // self.horizon  # 计算单个时间步的特征数
+            # 校验：确保 H*d_i 等于展平后的维度（避免维度不匹配）
+            assert obs_tensor.shape[1] == self.horizon * d_i, \
+                f"Obs group {obs_group} shape mismatch! Expected [B, H*d_i] = [{B}, {self.horizon}*{d_i}], got {obs_tensor.shape}"
+            obs_reshape = obs_tensor.reshape(B, self.horizon, d_i)  # [B, H, d_i]
+        elif len(obs_tensor.shape) == 3 and obs_tensor.shape[1] == self.horizon:
+            # 输入已是 [B, H, d_i]（三维格式）→ 直接使用
+            obs_reshape = obs_tensor
+        else:
+            # 不支持的格式，报错提示
+            raise ValueError(
+                f"Unsupported shape for obs group {obs_group}: {obs_tensor.shape}\n"
+                f"Expected [B, H*d_i] (2D) or [B, H, d_i] (3D) where H={self.horizon}"
+            )
+        
+        obs_list.append(obs_reshape)  # 所有观测组统一为 [B, H, d_i]
+    
+    # 拼接特征维度（dim=-1），得到 [B, H, d1 + d2 + ...]（d固定，比如88）
+    low_dim_obs = torch.cat(obs_list, dim=-1)  # [B, H, d]
+    print(f"low_dim_obs shape after processing: {low_dim_obs.shape}")  # 验证：[B, H, 88]
+
+    # 高维观测处理（同理，确保格式统一，可选）
+    high_dim_obs_list = []
+    for obs_group in self.obs_groups["perception"]:
+        high_dim_tensor = obs[obs_group]
+        # 可选：添加高维观测的格式校验（比如确保是 [B, H, ...] 格式）
+        high_dim_obs_list.append(high_dim_tensor)
+    high_dim_obs = torch.cat(high_dim_obs_list, dim=-1)  
+
+    return low_dim_obs, high_dim_obs
+
+三、关键修复说明
+1. 强制统一观测格式
+
+    对 2 维输入 [B, H*d_i]：通过 reshape(B, self.horizon, d_i) 拆分为 [B, H, d_i]，确保历史维度和特征维度分离。
+    对 3 维输入 [B, H, d_i]：直接使用，确保格式一致。
+    其他格式直接报错，避免隐式错误。
+
+2. 维度校验（避免逻辑错误）
+
+    添加 assert 校验：确保 2 维输入的长度是 H*d_i（比如 H=2 时，输入长度必须是 2 的倍数，避免无法拆分）。
+    明确报错信息，方便后续排查。
+
+3. 固定特征数
+所有观测组统一为 [B, H, d_i] 后，拼接 dim=-1 得到的 low_dim_obs 特征数是 sum(d_i)（比如 44+44=88），永远不会出现 176 的情况。
+四、补充验证步骤
+
+    运行前确保 self.horizon 已正确设置（历史长度，比如 2），且与观测的历史步数一致。
+    保留 print(f"low_dim_obs shape after processing: {low_dim_obs.shape}")，确认输出始终是 [B, H, 88]（比如 [64, 2, 88]，B=64，H=2）。
+    后续在 encoder 中处理时，low_dim_obs reshape 为 [B*H, 88]（比如 64*2=128 → [128, 88]），与线性层 self.proprio_linear(in_features=88) 完全匹配。
+
+五、为什么之前会波动？
+
+    当输入观测是 展平格式 [B, H*d_i] 时，注释掉处理逻辑后，直接拼接会导致特征数翻倍（比如 2 个组各 88 维 → 176 维）。
+    当输入观测是 三维格式 [B, H, d_i] 时，直接拼接特征数是 88 维。
+    修复后，无论输入是哪种格式，都会统一为 [B, H, d_i]，拼接后特征数固定。
+
+最终结论
+这段代码的注释导致观测格式处理缺失，是 low_dim_obs 特征数波动的根源。修复后，low_dim_obs 的特征数会始终固定为 88，线性层输入维度不匹配的问题会彻底解决。

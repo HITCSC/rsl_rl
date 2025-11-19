@@ -53,7 +53,7 @@ class SharedConv2d(nn.Module):
         return output
 
 class AttentionEncoderBlock(nn.Module):
-    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
+    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
         :param d: MHA模块的维度 (默认64)
@@ -65,6 +65,7 @@ class AttentionEncoderBlock(nn.Module):
         self.embedding_dim = embedding_dim
         self.h = h
         self.velocity_estimation_enabled = velocity_estimation_enabled
+        print(f"Attention Encoder Block: embedding_dim={embedding_dim}, h={h}, velocity_estimation_enabled={velocity_estimation_enabled}")
         # self.L, self.W = map_size
 
         # CNN用于处理高度图 (z值)
@@ -82,7 +83,6 @@ class AttentionEncoderBlock(nn.Module):
             # nn.ReLU(),
         )
         if self.velocity_estimation_enabled:
-            # print("Velocity Estimation Enabled in Attention Encoder Block")
             self.proprio_linear = nn.Sequential(
                 nn.Linear(d_obs, 256),
                 nn.ReLU(),
@@ -91,13 +91,14 @@ class AttentionEncoderBlock(nn.Module):
                 nn.Linear(128, embedding_dim),
             )
         else:
+            print("Velocity Estimation Disabled in Attention Encoder Block")
             # 本体感觉嵌入的线性层
             self.proprio_linear = nn.Linear(d_obs, embedding_dim) 
         
 
         # 多头注意力模块
         self.mha = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=h, batch_first=True)
-
+    # prop:prop_obs
     def forward(self, map_scans, proprioception):
         """
         :param map_scans: height scan/high level input, shape (B, H, L, W, 3)
@@ -113,6 +114,9 @@ class AttentionEncoderBlock(nn.Module):
         W = map_scans.shape[3]
         high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
         low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
+        # print("low_dim_obs shape:", low_dim_obs.shape)
+        # low_dim_obs = low_dim_obs[..., :91]
+        # print("low_dim_obs shape inside encoder:",low_dim_obs.shape)
 
         # 1. 处理地图扫描
         # 提取z值 (高度)
@@ -151,7 +155,7 @@ class AttentionEncoderBlock(nn.Module):
         history_map_enc = map_encoding.view(B,H,self.embedding_dim)
         history_attn_weights = attn_weights.view(B,H,L,W)
         if self.velocity_estimation_enabled:
-            return history_map_enc,proprioception,history_attn_weights,history_proprio_embedding[..., -1, -3:].squeeze(1)
+            return history_map_enc,proprioception,history_attn_weights,history_proprio_embedding[..., -3:]
         else:
             return history_map_enc,proprioception,history_attn_weights
 
@@ -160,7 +164,7 @@ class AttentionMapEncoder(nn.Module):
     完整的策略网络,包含编码器和后续MLP
     """
 
-    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
+    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
         """
         :param d_obs: 本体感知向量的维度(单次观测)
         :param d: 编码维度
@@ -168,7 +172,7 @@ class AttentionMapEncoder(nn.Module):
         """
         super(AttentionMapEncoder, self).__init__()
         # 这里需要对NaN的值进行处理,将其替换为0
-
+        print ("velocity_estimation_enabled:",velocity_estimation_enabled)
         # 注意力地图编码模块
         self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h,velocity_estimation_enabled)
 
