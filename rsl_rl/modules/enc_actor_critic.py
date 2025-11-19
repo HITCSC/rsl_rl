@@ -72,7 +72,7 @@ class EncActorCritic(nn.Module):
 
         self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
         print(f"Encoder : {self.encoder}")
-        # 这里obs为[512]        
+        # 这里obs为[env]
         self.horizon = scan_height_shape[1] 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
@@ -101,7 +101,7 @@ class EncActorCritic(nn.Module):
 
 
         # actor
-        # 155 * 3 = 465    465+ 9 = 474 
+        # 155(91+64) * 3 = 465    465+ 9 = 474 
         print("embedding_actor:",embedding_actor_dim)
         print("num_action",num_actions)
         self.actor = MLP(embedding_actor_dim, num_actions, actor_hidden_dims, activation)
