@@ -108,6 +108,7 @@ class AttentionEncoderBlock(nn.Module):
         :return: attn_weights: attention weights, shape (B, H, L, W)
         """
         # TODO map_scans的H使用prop的，何意味
+        # TODO MHA中要求批次维度与embedding维度一致。所以在encoder中必须保持 map_scans和proprioception的B和H一致
         B = map_scans.shape[0]
         H = proprioception.shape[1]
         L = map_scans.shape[2]

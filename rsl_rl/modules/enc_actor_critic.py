@@ -67,11 +67,12 @@ class EncActorCritic(nn.Module):
 
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity: torch.Tensor = None
+            self.history_estimated_velocity: torch.Tensor = None
 
 
         self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
         print(f"Encoder : {self.encoder}")
-        # 这里obs为[512]
+        # 这里obs为[512]        
         self.horizon = scan_height_shape[1] 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
@@ -163,6 +164,7 @@ class EncActorCritic(nn.Module):
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
+            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)]
         # compute mean
         mean = self.actor(embedding_vec)
@@ -175,7 +177,7 @@ class EncActorCritic(nn.Module):
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # create distribution
         self.distribution = Normal(mean, std)
-
+    # obs = ppo.obs_batch [B,H,d] tensordict
     def act(self, obs:TensorDict, **kwargs):
         low_dim_obs,high_dim_obs = self.get_actor_obs(obs)
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs)  # [B,H,d]
@@ -189,7 +191,8 @@ class EncActorCritic(nn.Module):
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
         print("embedding dim: ", embedding.shape)
         if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
+            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,1,3]
+            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
@@ -267,6 +270,7 @@ class EncActorCritic(nn.Module):
         """
         obs_list = []
         for obs_group in self.obs_groups["policy"]:
+            # command & policy
             # 这里假设每个group的历史堆叠形式是gym style的
             # if style == 'lab':
             #     gym_obs = self._lab_to_gym(obs[obs_group], self.horizon,keep_dim=False)  # [B,H,d]
@@ -275,8 +279,8 @@ class EncActorCritic(nn.Module):
             #     B = obs[obs_group].shape[0]
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
-        # TODO append在最后一个维度，不是b,h,d
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
+        # print("low_dim_obs key: ",low_dim_obs.items()) [envs,history,d] [...,91]
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
@@ -369,5 +373,10 @@ class EncActorCritic(nn.Module):
     def get_velocity_estimation(self)->torch.Tensor:
         if self.velocity_estimation_enabled and self.last_estimated_velocity is not None:
             return self.last_estimated_velocity
+        else:
+            return None
+    def get_history_velocity_estimation(self)->torch.Tensor:
+        if self.velocity_estimation_enabled and self.history_estimated_velocity is not None:
+            return self.history_estimated_velocity
         else:
             return None
