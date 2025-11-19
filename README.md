@@ -116,8 +116,26 @@ If you use the library with symmetry augmentation, please cite:
 }
 ```
 
-
-TODO 
-1.找到obs_batch 对应的真实速度slice
-2.验证估计速度的准确性——从embedding中提出速度。
-2.如何把网络估计的速度融入到policy_obs中
+## Record:
+1. get_observation()函数由manager_base中自定义，在attention_env_cfg中配置了obsgroup，并写入键值  ,具体结构如：
+```text
+{
+    "command": torch.Tensor(num_envs, h, D_command),  # 拼接后的指令张量
+    "policy": torch.Tensor(num_envs, h, D_policy),    # 拼接后的策略观测张量
+    "privileged": torch.Tensor(num_envs, h, D_privileged),  # 拼接后的特权观测张量
+    "perception": Tensordict({  # 子Tensordict，包含感知观测项
+        "map_scan": torch.Tensor(num_envs, h, D_map_scan)
+    }, batch_size=(num_envs, 1))
+}
+```
+2. 速度估计训练：在encoder中加入了两层线性层，接受本体感受（prop),速度估计输出在combination[B,-1,-3:]  
+```text
+self.proprio_linear = nn.Sequential(
+                nn.Linear(d_obs, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, embedding_dim),
+            )
+```
+3. obs维度：
