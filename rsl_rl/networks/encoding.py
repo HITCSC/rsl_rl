@@ -61,7 +61,7 @@ class AttentionEncoderBlock(nn.Module):
         :param map_size: 地图扫描的尺寸 (L, W)
         """
         super(AttentionEncoderBlock, self).__init__()
-
+        self.use_single_prep = True
         self.embedding_dim = embedding_dim
         self.h = h
         self.velocity_estimation_enabled = velocity_estimation_enabled
@@ -107,16 +107,22 @@ class AttentionEncoderBlock(nn.Module):
         :return: proprio_embedding: proprioception embedding, shape (B, H, embedding_dim)
         :return: attn_weights: attention weights, shape (B, H, L, W)
         """
-        # TODO map_scans的H使用prop的，何意味
+        # TODO map_scans的H使用prop的，何意味 
+        # TODO 单帧map_scan与多帧prop是否可行
         B = map_scans.shape[0]
+        # H_high_dim_obs = map_scans.shape[1]
         H = proprioception.shape[1]
         L = map_scans.shape[2]
         W = map_scans.shape[3]
-        high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
-        low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
-        # print("low_dim_obs shape:", low_dim_obs.shape)
-        # low_dim_obs = low_dim_obs[..., :91]
-        # print("low_dim_obs shape inside encoder:",low_dim_obs.shape)
+        # TODO 把H堆到obs的维度上
+        # high_dim_obs = map_scans.view(B,L,W,H*3) # (B, L, W, 3*H)
+        # low_dim_obs = proprioception.view(B, H *proprioception.shape[2:]) # (B, H*d_obs)
+        if self.use_single_prep:
+            high_dim_obs = map_scans.view(B,*map_scans.shape[2:]) # (B, L, W, 3)
+            low_dim_obs = proprioception.view(B,H*proprioception.shape[2:]) # (B, H*d_obs)
+        else:
+            high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
+            low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
 
         # 1. 处理地图扫描
         # 提取z值 (高度)
@@ -134,13 +140,17 @@ class AttentionEncoderBlock(nn.Module):
         # 拼接CNN特征和原始坐标
         local_features = torch.cat([high_dim_obs, cnn_features], dim=-1)  # (B*H, L, W, d)
 
-        # 重塑为点级特征 (B*H, L*W, d)
-        pointwise_features = local_features.reshape(B*H, L*W, self.embedding_dim)
+        if self.use_single_prep:
+            # 重塑为点级特征 (B, L*W, d)
+            pointwise_features = local_features.reshape(B, L*W, self.embedding_dim)
+        else:
+            # 重塑为点级特征 (B*H, L*W, d)
+            pointwise_features = local_features.reshape(B*H, L*W, self.embedding_dim)
 
         # 2. 处理本体感觉
-        proprio_embedding = self.proprio_linear(low_dim_obs)  # (B*H, d)
+        proprio_embedding = self.proprio_linear(low_dim_obs)  # (B*H, d) or (B,H*d)
         # print(proprio_embedding.shape)
-        proprio_embedding = proprio_embedding.unsqueeze(1)  # (B*H, 1, d)
+        proprio_embedding = proprio_embedding.unsqueeze(1)  # (B*H, 1, d) or (B,1,H*d)
 
         # 3. 多头注意力
         # 查询: proprio_embedding, 键值: pointwise_features

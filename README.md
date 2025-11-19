@@ -139,6 +139,7 @@ self.proprio_linear = nn.Sequential(
             )
 ```
 3. obs维度：
+ppo obs_batch -> AC.act(obs) -> AC.get_actor_obs
 
 ## 11.18解决：
 修复了low_dim_obs数据输入的bug；base_lin_vel提取的错误
