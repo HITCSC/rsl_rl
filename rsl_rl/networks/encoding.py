@@ -61,7 +61,7 @@ class AttentionEncoderBlock(nn.Module):
         :param map_size: 地图扫描的尺寸 (L, W)
         """
         super(AttentionEncoderBlock, self).__init__()
-        self.use_single_prep = True
+        self.use_single_prep = False
         self.embedding_dim = embedding_dim
         self.h = h
         self.velocity_estimation_enabled = velocity_estimation_enabled
@@ -114,16 +114,12 @@ class AttentionEncoderBlock(nn.Module):
         H = proprioception.shape[1]
         L = map_scans.shape[2]
         W = map_scans.shape[3]
-        # TODO 把H堆到obs的维度上
-        # high_dim_obs = map_scans.view(B,L,W,H*3) # (B, L, W, 3*H)
-        # low_dim_obs = proprioception.view(B, H *proprioception.shape[2:]) # (B, H*d_obs)
-        if self.use_single_prep:
-            high_dim_obs = map_scans.view(B,*map_scans.shape[2:]) # (B, L, W, 3)
-            low_dim_obs = proprioception.view(B,H*proprioception.shape[2:]) # (B, H*d_obs)
-        else:
-            high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
-            low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
-
+        # TODO 把H堆到obs的维度上,解耦map_scan —— 保证mha输入的第一维度（batch）相同和embedding维度相同
+        high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
+        low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
+        # 因为actor，critic复用同一个encoder，目前仅actor的base_lin_vel传000，统一输入dim [batch*h,91]
+        # 那么问题来了：因为critic中有真实速度传入，会不会影响Velocity estimator的训练
+        # 目前可以attention，因为所有的obs都加了history
         # 1. 处理地图扫描
         # 提取z值 (高度)
         z_values = high_dim_obs[..., 2:3]  # (B*H, L, W, 1)
@@ -140,17 +136,13 @@ class AttentionEncoderBlock(nn.Module):
         # 拼接CNN特征和原始坐标
         local_features = torch.cat([high_dim_obs, cnn_features], dim=-1)  # (B*H, L, W, d)
 
-        if self.use_single_prep:
-            # 重塑为点级特征 (B, L*W, d)
-            pointwise_features = local_features.reshape(B, L*W, self.embedding_dim)
-        else:
-            # 重塑为点级特征 (B*H, L*W, d)
-            pointwise_features = local_features.reshape(B*H, L*W, self.embedding_dim)
+        # 重塑为点级特征 (B*H, L*W, d)
+        pointwise_features = local_features.reshape(B*H, L*W, self.embedding_dim)
 
         # 2. 处理本体感觉
-        proprio_embedding = self.proprio_linear(low_dim_obs)  # (B*H, d) or (B,H*d)
+        proprio_embedding = self.proprio_linear(low_dim_obs)  # (B*H, d) 
         # print(proprio_embedding.shape)
-        proprio_embedding = proprio_embedding.unsqueeze(1)  # (B*H, 1, d) or (B,1,H*d)
+        proprio_embedding = proprio_embedding.unsqueeze(1)  # (B*H, 1, d) 
 
         # 3. 多头注意力
         # 查询: proprio_embedding, 键值: pointwise_features
@@ -195,11 +187,20 @@ class AttentionMapEncoder(nn.Module):
         """
         # ONNX 不支持 torch.isnan，使用 torch.where 替换
         map_scans = torch.where(torch.isnan(map_scans), torch.zeros_like(map_scans), map_scans)
+
+
+        # print("prop:",proprioception.shape)
+        # print("prop:",proprioception[0,0,...])
+        # proprioception = proprioception.view(B,H,:88)
         # 获取编码
         if self.encoder.velocity_estimation_enabled:
             map_encoding, proprioception, attention, estimated_velocity = self.encoder(map_scans, proprioception)
         else:
             map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
+        # attention [batch,h,L,W]
+        # print("attention size",attention.shape)
+        # attention = attention.view([...,-1,...])
+        # print("attention dim", attention.shape)
         # [B,H,d], [B,H,d_obs], [B,H,L,W]
         # 拼接地图编码和原始本体感觉
         if (embedding_only):

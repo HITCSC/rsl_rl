@@ -30,6 +30,7 @@ class EncActorCritic(nn.Module):
         velocity_estimation_enabled: bool = True,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
+        critic_encoder:bool=True,
         **kwargs,
     ):
         if kwargs:
@@ -38,7 +39,8 @@ class EncActorCritic(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
-
+        self.critic_encoder = critic_encoder
+        print("critic_encoder",self.critic_encoder)
         # get the observation dimensions
         self.obs_groups = obs_groups
         num_actor_obs = 0  # obervation dimensions in 1 stamp for the actor
@@ -69,8 +71,10 @@ class EncActorCritic(nn.Module):
             self.last_estimated_velocity: torch.Tensor = None
             self.history_estimated_velocity: torch.Tensor = None
 
-
         self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
+        if self.critic_encoder:
+            print("use 2 encoder")
+            self.critic_encoder2 = AttentionMapEncoder(self.num_critic_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
         print(f"Encoder : {self.encoder}")
         # 这里obs为[env]
         self.horizon = scan_height_shape[1] 
@@ -81,8 +85,11 @@ class EncActorCritic(nn.Module):
             embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs + 3)
         else:
             embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
-
-        embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_c+d)]
+        if self.critic_encoder:
+            embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_obs + d)]
+        else:
+            embedding_critic_dim = num_critic_obs
+        # 1536 * 91 -> MLP 91*256 ... 
         self.embedding_actor_dim = embedding_actor_dim
         self.embedding_critic_dim = embedding_critic_dim 
         # 这里需要构造一个从critic到actor obs的mask, 但是当前仍然只支持1d的输入
@@ -161,6 +168,7 @@ class EncActorCritic(nn.Module):
         :param perception_obs: [B, H, d_obs]
         """
         # compute embedding 
+        # print("AC_prop: ", prop_obs[0,0,...])
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
@@ -182,14 +190,16 @@ class EncActorCritic(nn.Module):
         low_dim_obs,high_dim_obs = self.get_actor_obs(obs)
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs)  # [B,H,d]
         self.update_distribution(low_dim_obs,high_dim_obs)
+        # action = self.distribution.sample()
+        # print("action",action.shape)
         return self.distribution.sample()
 
     def act_inference(self, obs):
         low_dim_obs,high_dim_obs = self.get_actor_obs(obs)  # [B,H,d]
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs) # [B,H,d]
         # compute embedding 
+        # 验证attention
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
-        print("embedding dim: ", embedding.shape)
         if self.velocity_estimation_enabled:
             self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,1,3]
             self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
@@ -200,16 +210,20 @@ class EncActorCritic(nn.Module):
             return action,attention
         else:
             return action
-
+    # 是否有必要全给history，如果没有必要如何修改？
     def evaluate(self, obs, **kwargs):
+        # TODO critic需不需要加入encoder的输入
         low_dim_obs,high_dim_obs = self.get_critic_obs(obs)  # [B,H,d]
         low_dim_obs = self.critic_obs_normalizer(low_dim_obs)
         # TODO : 这里需要针对(B,H*d)的情况进行处理
         low_dim_query = low_dim_obs # [B,H,d] 假设是一样的，只不过不带噪声
         # low_dim_query = low_dim_obs[:,:,self.critic_to_actor_mask]  # [B,H,d] for attention query
-        embedding,_ = self.encoder(high_dim_obs,low_dim_query,embedding_only=True)
-        critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
-        critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
+        if self.critic_encoder:
+            embedding,_ = self.critic_encoder2(high_dim_obs,low_dim_query,embedding_only=True)
+            critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
+            critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
+        else:  
+            critic_obs = low_dim_obs
         values = self.critic(critic_obs)
         return values
     
@@ -280,7 +294,8 @@ class EncActorCritic(nn.Module):
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
-        # print("low_dim_obs key: ",low_dim_obs.items()) [envs,history,d] [...,91]
+        # print("AC low_dim_obs: ",low_dim_obs.shape)
+        # print("low_dim_obs key: ",low_dim_obs.items()) [envs,history,d] [...,91(vel)/88]
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
