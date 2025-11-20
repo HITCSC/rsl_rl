@@ -30,7 +30,7 @@ class EncActorCritic(nn.Module):
         velocity_estimation_enabled: bool = True,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
-        critic_encoder:bool=True,
+        critic_encoder:bool=False,
         **kwargs,
     ):
         if kwargs:
@@ -75,6 +75,8 @@ class EncActorCritic(nn.Module):
         if self.critic_encoder:
             print("use 2 encoder")
             self.critic_encoder2 = AttentionMapEncoder(self.num_critic_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
+        else:
+            print("critic don't use a encoder")
         print(f"Encoder : {self.encoder}")
         # 这里obs为[env]
         self.horizon = scan_height_shape[1] 
@@ -88,7 +90,7 @@ class EncActorCritic(nn.Module):
         if self.critic_encoder:
             embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_obs + d)]
         else:
-            embedding_critic_dim = num_critic_obs
+            embedding_critic_dim = self.horizon * num_critic_obs
         # 1536 * 91 -> MLP 91*256 ... 
         self.embedding_actor_dim = embedding_actor_dim
         self.embedding_critic_dim = embedding_critic_dim 
@@ -223,7 +225,7 @@ class EncActorCritic(nn.Module):
             critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
             critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
         else:  
-            critic_obs = low_dim_obs
+            critic_obs = low_dim_obs.view(low_dim_obs.shape[0],-1)
         values = self.critic(critic_obs)
         return values
     
