@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic,EncActorCritic
+from rsl_rl.modules import ActorCritic,EncActorCritic, EncVelActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic|EncActorCritic
+    policy: ActorCritic|EncActorCritic | EncVelActorCritic
     """The actor critic module."""
 
     def __init__(
