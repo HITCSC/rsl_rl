@@ -7,7 +7,10 @@ from tensordict import TensorDict
 from rsl_rl.networks import MLP, EmpiricalNormalization, AttentionMapEncoder 
 from rsl_rl.networks.estimator import Velocity_Estimator
 
-class EncActorCritic(nn.Module):
+# 为了actor and critic复用encoder —— 解耦速度估计器  将速度估计3dim输入到 act中\
+# 有很多shit代码：由于先update_actor_obs_norm再拼接速度，可能存在问题
+# 且输出单帧数据
+class EncVelActorCritic(nn.Module):
     is_recurrent = False
     LOAD_POLICY_WEIGHTS = 1
     LOAD_CRITIC_WEIGHTS = 2
@@ -27,7 +30,7 @@ class EncActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         embedding_dim=64,
-        velocity_estimation_enabled: bool = True,
+        velocity_estimation_enabled: bool = False,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
         critic_encoder:bool=False,
@@ -35,28 +38,33 @@ class EncActorCritic(nn.Module):
     ):
         if kwargs:
             print(
-                "EncActorCritic.__init__ got unexpected arguments, which will be ignored: "
+                "EncVelActorCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
-        self.critic_encoder = critic_encoder
-        print("critic_encoder",self.critic_encoder)
         # get the observation dimensions
         self.obs_groups = obs_groups
         num_actor_obs = 0  # obervation dimensions in 1 stamp for the actor
         for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) > 2, "The EncActorCritic module only supports obs shape [B,H,d,...]. "
+            assert len(obs[obs_group].shape) > 2, "The EncVelActorCritic module only supports obs shape [B,H,d,...]. "
             "for IsaacLab, you need to make sure that flatten_history_dim is False."
             num_actor_obs += obs[obs_group].shape[-1]
         num_critic_obs = 0 # obervation dimensions in 1 stamp for the critic 
         for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) > 2, "The EncActorCritic module only supports obs shape [B,H,d,...]. "
+            assert len(obs[obs_group].shape) > 2, "The EncVelActorCritic module only supports obs shape [B,H,d,...]. "
             "for IsaacLab, you need to make sure that flatten_history_dim is False."
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
+        self.dis_vel_estimator = True
+        print("dis_vel", self.dis_vel_estimator)
+        # 需要配合设置 policy_obs里没有
+        if self.dis_vel_estimator:
+            self.num_actor_obs  += 3
+            print("dis_vel_estimator")
         self.num_critic_obs = num_critic_obs
-        self.velocity_estimation_enabled = velocity_estimation_enabled
-
+        print("num_actor",self.num_actor_obs)
+        print("num_critic",self.num_critic_obs)
+        
         # Encoder :
         # num_perception_obs = 0
         scan_height_shape = []
@@ -67,30 +75,29 @@ class EncActorCritic(nn.Module):
                 scan_height_shape = obs[obs_group].shape # 
         self.embedding_dim = embedding_dim
 
-        if self.velocity_estimation_enabled:
+        if self.dis_vel_estimator:
             self.last_estimated_velocity: torch.Tensor = None
             self.history_estimated_velocity: torch.Tensor = None
 
-        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
-        if self.critic_encoder:
-            print("use 2 encoder")
-            self.critic_encoder2 = AttentionMapEncoder(self.num_critic_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
-        else:
-            print("critic don't use a encoder")
+        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
         print(f"Encoder : {self.encoder}")
+        
         # 这里obs为[env]
         self.horizon = scan_height_shape[1] 
+
+        self.velocity_estimator = Velocity_Estimator(history_len=self.horizon, d_obs=88,output_dim=3)
+
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
         self.output_attention = output_attention  # 是否输出attention 
-        if self.velocity_estimation_enabled:
-            embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs + 3)
+        
+        if self.dis_vel_estimator:
+            embedding_actor_dim = self.embedding_dim + self.num_actor_obs
+            embedding_critic_dim = self.embedding_dim + num_critic_obs
         else:
             embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
-        if self.critic_encoder:
             embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_obs + d)]
-        else:
-            embedding_critic_dim = self.horizon * num_critic_obs
+
         # 1536 * 91 -> MLP 91*256 ... 
         self.embedding_actor_dim = embedding_actor_dim
         self.embedding_critic_dim = embedding_critic_dim 
@@ -112,12 +119,11 @@ class EncActorCritic(nn.Module):
         # actor
         # 155(91+64) * 3 = 465    465+ 9 = 474 
         print("embedding_actor:",embedding_actor_dim)
-        print("num_action",num_actions)
         self.actor = MLP(embedding_actor_dim, num_actions, actor_hidden_dims, activation)
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,num_actor_obs))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
+            self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,self.num_actor_obs))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
@@ -172,9 +178,7 @@ class EncActorCritic(nn.Module):
         # print("AC_prop: ", prop_obs[0,0,...])
 
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
-        if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
-            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
+        
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)] 残差连接
         # compute mean
         mean = self.actor(embedding_vec)
@@ -189,9 +193,9 @@ class EncActorCritic(nn.Module):
         self.distribution = Normal(mean, std)
     # obs = ppo.obs_batch [B,H,d] tensordict
     def act(self, obs:TensorDict, **kwargs):
+        # 需要先归一化再拼接
         low_dim_obs,high_dim_obs = self.get_actor_obs(obs)
         low_dim_obs = self.actor_obs_normalizer(low_dim_obs)  # [B,H,d]
-        # 此处增加
         self.update_distribution(low_dim_obs,high_dim_obs)
         # action = self.distribution.sample()
         # print("action",action.shape)
@@ -203,9 +207,6 @@ class EncActorCritic(nn.Module):
         # compute embedding 
         # 验证attention
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
-        if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,1,3]
-            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
@@ -216,17 +217,21 @@ class EncActorCritic(nn.Module):
     # 是否有必要全给history，如果没有必要如何修改？
     def evaluate(self, obs, **kwargs):
         # TODO critic需不需要加入encoder的输入
-        low_dim_obs,high_dim_obs = self.get_critic_obs(obs)  # [B,H,d]
+        low_dim_obs,high_dim_obs = self.get_critic_obs(obs)  # [B,H,d] 如果dis_vel:1帧
         low_dim_obs = self.critic_obs_normalizer(low_dim_obs)
         # TODO : 这里需要针对(B,H*d)的情况进行处理
         low_dim_query = low_dim_obs # [B,H,d] 假设是一样的，只不过不带噪声
         # low_dim_query = low_dim_obs[:,:,self.critic_to_actor_mask]  # [B,H,d] for attention query
-        if self.critic_encoder:
-            embedding,_ = self.critic_encoder2(high_dim_obs,low_dim_query,embedding_only=True)
+        # if self.critic_encoder:
+        #     embedding,_ = self.critic_encoder2(high_dim_obs,low_dim_query,embedding_only=True)
+        #     critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
+        #     critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
+        # else:  
+        #     critic_obs = low_dim_obs.view(low_dim_obs.shape[0],-1)
+        if self.dis_vel_estimator:
+            embedding,_ = self.encoder(high_dim_obs,low_dim_query,embedding_only=True)
             critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
             critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
-        else:  
-            critic_obs = low_dim_obs.view(low_dim_obs.shape[0],-1)
         values = self.critic(critic_obs)
         return values
     
@@ -297,12 +302,24 @@ class EncActorCritic(nn.Module):
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
-        # print("AC low_dim_obs: ",low_dim_obs.shape)
-        # print("low_dim_obs key: ",low_dim_obs.items()) [envs,history,d] [...,91(vel)/88]
+        
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
-        high_dim_obs = torch.cat(high_dim_obs_list, dim=-1)  
+        high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
+        if self.dis_vel_estimator:
+            B = low_dim_obs.shape[0]
+            H = low_dim_obs.shape[1]
+            # veloity输入位置有问题，没有batch ... 
+            velocity_batch = self.velocity_estimator(low_dim_obs) # [B*H,3]
+            vel_esitimated = velocity_batch.reshape(B,H,3)
+            self.last_estimated_velocity = vel_esitimated[:,-1,:]
+            vel_esitimated_new = vel_esitimated[:,-1,:]
+            low_dim_obs_new = low_dim_obs[:,-1,:]
+            low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_new],dim =-1)
+            high_dim_obs = high_dim_obs[:,-1,:]
+            low_dim_obs = low_dim_obs.unsqueeze(dim=1)
+            high_dim_obs = high_dim_obs.unsqueeze(dim=1)
         return low_dim_obs,high_dim_obs
 
     def get_critic_obs(self, obs:TensorDict,style:str='lab')->tuple:
@@ -321,6 +338,11 @@ class EncActorCritic(nn.Module):
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
         high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
+        if self.dis_vel_estimator:
+            low_dim_obs = low_dim_obs[:,-1,:]
+            high_dim_obs = high_dim_obs[:,-1,:]
+            low_dim_obs = low_dim_obs.unsqueeze(dim=1)
+            high_dim_obs = high_dim_obs.unsqueeze(dim=1)
         return low_dim_obs,high_dim_obs
 
     def get_actions_log_prob(self, actions):
@@ -329,6 +351,9 @@ class EncActorCritic(nn.Module):
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
             actor_obs,_ = self.get_actor_obs(obs)
+            #传入的 actor_obs [b,3,88]
+            actor_obs = actor_obs[:,-1,:]
+            actor_obs = actor_obs.unsqueeze(dim=1)
             self.actor_obs_normalizer.update(actor_obs)
         if self.critic_obs_normalization:
             critic_obs,_ = self.get_critic_obs(obs)
@@ -364,32 +389,32 @@ class EncActorCritic(nn.Module):
         if self.load_mask & self.LOAD_POLICY_WEIGHTS:
             actor_state_dict = {k.replace('actor.', '',1): v for k, v in state_dict.items() if k.startswith('actor.')}
             self.actor.load_state_dict(actor_state_dict, strict=strict)
-            print("=== EncActorCritic : Load Actor Weights ===")
+            print("=== EncVelActorCritic : Load Actor Weights ===")
             # TODO : 这里需要确认一下, 是否需要加载std的参数
         if self.load_mask & self.LOAD_CRITIC_WEIGHTS:
             critic_state_dict = {k.replace('critic.', '',1): v for k, v in state_dict.items() if k.startswith('critic.')}
             self.critic.load_state_dict(critic_state_dict, strict=strict)
-            print("=== EncActorCritic : Load Critic Weights ===")
+            print("=== EncVelActorCritic : Load Critic Weights ===")
         if self.load_mask & self.LOAD_ENCODER_WEIGHTS:
             enc_state_dict = {k.replace('encoder.', '',1): v for k, v in state_dict.items() if k.startswith('encoder.')}
             self.encoder.load_state_dict(enc_state_dict, strict=strict)
-            print("=== EncActorCritic : Load Encoder Weights ===")
+            print("=== EncVelActorCritic : Load Encoder Weights ===")
         # 这里还需要load normalization的参数
         if (self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
             # if (self.actor_obs_normalization) and ('actor_obs_normalizer' in state_dict):
             if (self.actor_obs_normalization):
                 act_obs_norm_state_dict = {k.replace('actor_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('actor_obs_normalizer.')}
                 self.actor_obs_normalizer.load_state_dict(act_obs_norm_state_dict)
-                print("=== EncActorCritic : Load actor normalizer weights ===")
+                print("=== EncVelActorCritic : Load actor normalizer weights ===")
             # if (self.critic_obs_normalization) and ('critic_obs_normalizer' in state_dict):
             if (self.critic_obs_normalization):
                 critic_obs_norm_state_dict = {k.replace('critic_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('critic_obs_normalizer.')}
                 self.critic_obs_normalizer.load_state_dict(critic_obs_norm_state_dict)
-                print("=== EncActorCritic : Load critic normalizer weights ===")
+                print("=== EncVelActorCritic : Load critic normalizer weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
     def get_velocity_estimation(self)->torch.Tensor:
-        if self.velocity_estimation_enabled and self.last_estimated_velocity is not None:
+        if self.dis_vel_estimator and self.last_estimated_velocity is not None:
             return self.last_estimated_velocity
         else:
             return None

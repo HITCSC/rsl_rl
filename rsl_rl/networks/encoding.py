@@ -53,7 +53,7 @@ class SharedConv2d(nn.Module):
         return output
 
 class AttentionEncoderBlock(nn.Module):
-    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
+    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
         :param d: MHA模块的维度 (默认64)
@@ -114,8 +114,9 @@ class AttentionEncoderBlock(nn.Module):
         H = proprioception.shape[1]
         L = map_scans.shape[2]
         W = map_scans.shape[3]
+        # 需要解决输入维度不一样的问题——把H堆到obs的维度上,解耦map_scan，但是我传入的都是一帧的啊
         # TODO 把H堆到obs的维度上,解耦map_scan —— 保证mha输入的第一维度（batch）相同和embedding维度相同
-        high_dim_obs = map_scans.view(B*H,*map_scans.shape[2:]) # (B*H, L, W, 3)
+        high_dim_obs = map_scans.view(B,*map_scans.shape[2:]) # (B*H, L, W, 3)
         low_dim_obs = proprioception.view(B*H, *proprioception.shape[2:]) # (B*H, d_obs)
         # 因为actor，critic复用同一个encoder，目前仅actor的base_lin_vel传000，统一输入dim [batch*h,91]
         # 那么问题来了：因为critic中有真实速度传入，会不会影响Velocity estimator的训练
