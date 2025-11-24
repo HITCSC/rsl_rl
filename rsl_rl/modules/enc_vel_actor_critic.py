@@ -44,6 +44,7 @@ class EncVelActorCritic(nn.Module):
         super().__init__()
         # get the observation dimensions
         self.obs_groups = obs_groups
+        actor_obs_shape = []
         num_actor_obs = 0  # obervation dimensions in 1 stamp for the actor
         for obs_group in obs_groups["policy"]:
             assert len(obs[obs_group].shape) > 2, "The EncVelActorCritic module only supports obs shape [B,H,d,...]. "
@@ -58,7 +59,7 @@ class EncVelActorCritic(nn.Module):
         self.dis_vel_estimator = True
         print("dis_vel", self.dis_vel_estimator)
         # 需要配合设置 policy_obs里没有
-        if self.dis_vel_estimator:
+        if self.dis_vel_estimator and num_actor_obs!=91:
             self.num_actor_obs  += 3
             print("dis_vel_estimator")
         self.num_critic_obs = num_critic_obs
@@ -83,9 +84,9 @@ class EncVelActorCritic(nn.Module):
         print(f"Encoder : {self.encoder}")
         
         # 这里obs为[env]
-        self.horizon = scan_height_shape[1] 
+        self.horizon = scan_height_shape[1]  # TODO 有坑，默认使用map_scan的history作为整个系统的历史观测长度，后续考虑分离——num_actor_obs等等 ——MLP的输入维度
 
-        self.velocity_estimator = Velocity_Estimator(history_len=self.horizon, d_obs=88,output_dim=3)
+        self.velocity_estimator = Velocity_Estimator(history_len=5, d_obs=88,output_dim=3)
 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
@@ -310,16 +311,20 @@ class EncVelActorCritic(nn.Module):
         if self.dis_vel_estimator:
             B = low_dim_obs.shape[0]
             H = low_dim_obs.shape[1]
-            # veloity输入位置有问题，没有batch ... 
-            velocity_batch = self.velocity_estimator(low_dim_obs) # [B*H,3]
-            vel_esitimated = velocity_batch.reshape(B,H,3)
-            self.last_estimated_velocity = vel_esitimated[:,-1,:]
-            vel_esitimated_new = vel_esitimated[:,-1,:]
-            low_dim_obs_new = low_dim_obs[:,-1,:]
-            low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_new],dim =-1)
-            high_dim_obs = high_dim_obs[:,-1,:]
-            low_dim_obs = low_dim_obs.unsqueeze(dim=1)
-            high_dim_obs = high_dim_obs.unsqueeze(dim=1)
+            vel_esitimated = self.velocity_estimator(low_dim_obs)  # [B,3]
+            self.last_estimated_velocity = vel_esitimated
+            vel_esitimated_reshape = vel_esitimated.view(B,1,-1)  # [B,1,3] #stage2 的时候再拼接
+            low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
+            # TODO 增加替换逻辑：用Vel_est替换policy_obs里的速度 替换low_obs_dim中第5,6,7位
+            
+            # stage2 替换后的训练，到时需要返回low_dim_obs
+            # low_dim_obs_new[:,4:7] = vel_esitimated_reshape  # [B,1,d]
+            # low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
+            # low_dim_obs = low_dim_obs.unsqueeze(dim=1)
+            low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
+
+            # stage1 训练estimator，但使用实际速度 直接返回low_dim_obs_new
+            high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
         return low_dim_obs,high_dim_obs
 
     def get_critic_obs(self, obs:TensorDict,style:str='lab')->tuple:

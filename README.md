@@ -162,3 +162,8 @@ A：目前的课程上不去，尝试分离估计器。使用单帧map_scan与�
 分离速度估计器，先用两层linear_layers(input_dim = h*d_obs(h*88)) 估计速度输出，拼接到low_dim_obs :5,6,7位。 estimator——单帧map_scan
 
 目前 enc_vel_actor_critic 很屎，直接在get_obs里面 估计速度再处理拼接，然后输出单帧的obs----目前encoder只接受一帧数据
+
+## 10.23训练
+1. 实际速度不跟踪指令速度而且实际很大是否与传入了错误的policy_obs相关？（前期因为policy_obs传入的速度本身就不准，因为站不住）——如何修改？ 根据episode_length来判断是否使用估计速度？代码实现or分阶段训练？，stage1：前期训练不用速度估计，待epl上去之后才使用速度估计；stage2：Loss_vel下去之后用vel_est代替policy_vel。
+Q:而且目前Loss_velocity的曲线也很奇怪，最大才0.03？ epl为什么能上去？800 但是play的时候站不住？ 跟command给了history有关系吗？
+速度估计有个错误：传出的[B,H,3] 是否这里没用上历史的观测——或者bp的时候没有成功？ 现在改成输出[B,3]尝试
