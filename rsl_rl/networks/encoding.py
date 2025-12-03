@@ -53,7 +53,7 @@ class SharedConv2d(nn.Module):
         return output
 
 class AttentionEncoderBlock(nn.Module):
-    def __init__(self, d_obs:int,embedding_dim=64, h=16,velocity_estimation_enabled: bool = False):
+    def __init__(self, d_obs:int,embedding_dim=64, h=16):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
         :param d: MHA模块的维度 (默认64)
@@ -64,8 +64,6 @@ class AttentionEncoderBlock(nn.Module):
         self.use_single_prep = False
         self.embedding_dim = embedding_dim
         self.h = h
-        self.velocity_estimation_enabled = velocity_estimation_enabled
-        print(f"Attention Encoder Block: embedding_dim={embedding_dim}, h={h}, velocity_estimation_enabled={velocity_estimation_enabled}")
         # self.L, self.W = map_size
 
         # CNN用于处理高度图 (z值)
@@ -82,18 +80,8 @@ class AttentionEncoderBlock(nn.Module):
             # nn.BatchNorm2d(self.embedding_dim - 3),
             # nn.ReLU(),
         )
-        if self.velocity_estimation_enabled:
-            self.proprio_linear = nn.Sequential(
-                nn.Linear(d_obs, 256),
-                nn.ReLU(),
-                nn.Linear(256, 128),
-                nn.ReLU(),
-                nn.Linear(128, embedding_dim),
-            )
-        else:
-            print("Velocity Estimation Disabled in Attention Encoder Block")
-            # 本体感觉嵌入的线性层
-            self.proprio_linear = nn.Linear(d_obs, embedding_dim) 
+
+        self.proprio_linear = nn.Linear(d_obs, embedding_dim) 
         
 
         # 多头注意力模块
@@ -157,17 +145,14 @@ class AttentionEncoderBlock(nn.Module):
         history_proprio_embedding = proprio_embedding.view(B,H,self.embedding_dim)
         history_map_enc = map_encoding.view(B,H,self.embedding_dim)
         history_attn_weights = attn_weights.view(B,H,L,W)
-        if self.velocity_estimation_enabled:
-            return history_map_enc,proprioception,history_attn_weights,history_proprio_embedding[..., -3:]
-        else:
-            return history_map_enc,proprioception,history_attn_weights
+        return history_map_enc,proprioception,history_attn_weights
 
 class AttentionMapEncoder(nn.Module):
     """
     完整的策略网络,包含编码器和后续MLP
     """
 
-    def __init__(self, d_obs, embedding_dim=64, h=16,velocity_estimation_enabled: bool = True):
+    def __init__(self, d_obs, embedding_dim=64, h=16):
         """
         :param d_obs: 本体感知向量的维度(单次观测)
         :param d: 编码维度
@@ -175,9 +160,8 @@ class AttentionMapEncoder(nn.Module):
         """
         super(AttentionMapEncoder, self).__init__()
         # 这里需要对NaN的值进行处理,将其替换为0
-        print ("velocity_estimation_enabled:",velocity_estimation_enabled)
         # 注意力地图编码模块
-        self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h,velocity_estimation_enabled)
+        self.encoder = AttentionEncoderBlock(d_obs, embedding_dim, h)
 
     def forward(self, map_scans, proprioception, embedding_only=False):
         """
@@ -194,10 +178,7 @@ class AttentionMapEncoder(nn.Module):
         # print("prop:",proprioception[0,0,...])
         # proprioception = proprioception.view(B,H,:88)
         # 获取编码
-        if self.encoder.velocity_estimation_enabled:
-            map_encoding, proprioception, attention, estimated_velocity = self.encoder(map_scans, proprioception)
-        else:
-            map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
+        map_encoding, proprioception,attention = self.encoder(map_scans, proprioception)
         # attention [batch,h,L,W]
         # print("attention size",attention.shape)
         # attention = attention.view([...,-1,...])
@@ -207,10 +188,7 @@ class AttentionMapEncoder(nn.Module):
         if (embedding_only):
             return map_encoding,attention
         else:
-            if self.encoder.velocity_estimation_enabled:
-                combined = torch.cat([map_encoding, proprioception, estimated_velocity], dim=-1)  # (B, H ,d + d_obs + vel_dim)
-            else:
-                combined = torch.cat([map_encoding, proprioception], dim=-1)  # (B, H, d + d_obs)
+            combined = torch.cat([map_encoding, proprioception], dim=-1)  # (B, H, d + d_obs)
             return combined, attention
 
 

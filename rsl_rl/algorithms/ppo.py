@@ -40,7 +40,7 @@ class PPO:
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
-        velocity_estimation_enabled: bool = True,
+        velocity_estimation_enabled: bool = False,
         velocity_loss_coef=0.5,
         cnt = 0,
         # RND parameters
@@ -121,6 +121,7 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.velocity_estimation_enabled = velocity_estimation_enabled
+        print("PPO velocity_estimation_enabled:", self.velocity_estimation_enabled)
         self.velocity_loss_coef = velocity_loss_coef
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
@@ -461,7 +462,7 @@ class PPO:
             if mean_velocity_loss < 0.5 :
                 self.cnt += 1
                 if self.cnt > 10:
-                    print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
+                    # print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
                     self.use_estimated_vel = True
             else:
                 self.cnt = 0

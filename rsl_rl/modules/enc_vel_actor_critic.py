@@ -16,6 +16,7 @@ class EncVelActorCritic(nn.Module):
     LOAD_CRITIC_WEIGHTS = 2
     LOAD_ENCODER_WEIGHTS = 4 
     LOAD_NORMALIZER_WEIGHTS = 8
+    LOAD_VELOCITY_WEIGHTS = 16
 
     def __init__(
         self,
@@ -28,10 +29,11 @@ class EncVelActorCritic(nn.Module):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
-        noise_std_type: str = "scalar",
+        noise_std_type: str = "log",
         embedding_dim=64,
         velocity_estimation_enabled: bool = False,
-        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
+        dis_vel_estimator: bool = True,
+        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS|LOAD_VELOCITY_WEIGHTS,
         output_attention:bool=False,
         critic_encoder:bool=False,
         **kwargs,
@@ -56,7 +58,7 @@ class EncVelActorCritic(nn.Module):
             "for IsaacLab, you need to make sure that flatten_history_dim is False."
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
-        self.dis_vel_estimator = True
+        self.dis_vel_estimator = dis_vel_estimator
         print("dis_vel", self.dis_vel_estimator)
         # 需要配合设置 policy_obs里没有
         if self.dis_vel_estimator and num_actor_obs!=91:
@@ -80,13 +82,13 @@ class EncVelActorCritic(nn.Module):
             self.last_estimated_velocity: torch.Tensor = None
             self.history_estimated_velocity: torch.Tensor = None
 
-        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
+        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
         print(f"Encoder : {self.encoder}")
         
         # 这里obs为[env]
         self.horizon = scan_height_shape[1]  # TODO 有坑，默认使用map_scan的history作为整个系统的历史观测长度，后续考虑分离——num_actor_obs等等 ——MLP的输入维度
 
-        self.velocity_estimator = Velocity_Estimator(history_len=5, d_obs=88,output_dim=3)
+        self.velocity_estimator = Velocity_Estimator(history_len=5, d_obs=84,output_dim=3)
 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
@@ -311,21 +313,33 @@ class EncVelActorCritic(nn.Module):
         if self.dis_vel_estimator:
             B = low_dim_obs.shape[0]
             H = low_dim_obs.shape[1]
-            vel_esitimated = self.velocity_estimator(low_dim_obs)  # [B,3]
+            # stage1 训练estimator，low_obs_dim中使用实际速度传入encoder,但要考虑传入estimator的不要包含速度
+            #去掉low_dim_obs的速度部分,在tensor中为第4，5，6位
+            # 12.2 TODO 去掉low_dim_obs的前7维度
+            input_estimator = low_dim_obs[:,:,7:]
+            # input_estimator = torch.cat([low_dim_obs[:,:,:4],low_dim_obs[:,:,7:]],dim=-1)  # [B,H,d-3]
+            # print("origin_obs",low_dim_obs[0,0,...])
+            # print("input_estimator",input_estimator[0,0,...])
+            vel_esitimated = self.velocity_estimator(input_estimator)  # [B,3]
+            # print("estimated vel:",vel_esitimated[0,...])
+            # print("real vel:",low_dim_obs[0,-1,4:7])
             self.last_estimated_velocity = vel_esitimated
-            vel_esitimated_reshape = vel_esitimated.view(B,1,-1)  # [B,1,3] #stage2 的时候再拼接
+            vel_esitimated_reshape = vel_esitimated.unsqueeze(dim=1)  # [B,1,3]
             low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
-            # TODO 增加替换逻辑：用Vel_est替换policy_obs里的速度 替换low_obs_dim中第5,6,7位
-            
-            # stage2 替换后的训练，到时需要返回low_dim_obs
-            # low_dim_obs_new[:,4:7] = vel_esitimated_reshape  # [B,1,d]
-            # low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
-            # low_dim_obs = low_dim_obs.unsqueeze(dim=1)
-            low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
+            # 修正索引：用[:, :, 4:7]（形状[B,1,3]）匹配vel_esitimated_reshape的[B,1,3]
 
+
+            # stage2: 使用替换后的速度估计
+            low_dim_obs_new[:, :, 4:7] = vel_esitimated_reshape  # 
+
+
+            # print("low_dim_obs_modify",low_dim_obs_new[0,0,4:7])
+            # low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
+            # low_dim_obs = low_dim_obs_new.unsqueeze(dim=1)
+            # print("low_dim_obs shape",low_dim_obs.shape)
             # stage1 训练estimator，但使用实际速度 直接返回low_dim_obs_new
             high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
-        return low_dim_obs,high_dim_obs
+        return low_dim_obs_new,high_dim_obs
 
     def get_critic_obs(self, obs:TensorDict,style:str='lab')->tuple:
         obs_list = []
@@ -339,6 +353,7 @@ class EncVelActorCritic(nn.Module):
             #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
+        #print("critic_low_dim_obs",low_dim_obs[0,0,...])
         high_dim_obs_list = []
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
@@ -416,15 +431,14 @@ class EncVelActorCritic(nn.Module):
                 critic_obs_norm_state_dict = {k.replace('critic_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('critic_obs_normalizer.')}
                 self.critic_obs_normalizer.load_state_dict(critic_obs_norm_state_dict)
                 print("=== EncVelActorCritic : Load critic normalizer weights ===")
+        if self.load_mask & self.LOAD_VELOCITY_WEIGHTS:
+            vel_state_dict = {k.replace('velocity_estimator.', '',1): v for k, v in state_dict.items() if k.startswith('velocity_estimator.')}
+            self.velocity_estimator.load_state_dict(vel_state_dict, strict=strict)
+            print("=== EncVelActorCritic : Load Velocity Estimator Weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
     def get_velocity_estimation(self)->torch.Tensor:
         if self.dis_vel_estimator and self.last_estimated_velocity is not None:
             return self.last_estimated_velocity
-        else:
-            return None
-    def get_history_velocity_estimation(self)->torch.Tensor:
-        if self.velocity_estimation_enabled and self.history_estimated_velocity is not None:
-            return self.history_estimated_velocity
         else:
             return None

@@ -5,7 +5,6 @@ import torch.nn as nn
 from torch.distributions import Normal
 from tensordict import TensorDict 
 from rsl_rl.networks import MLP, EmpiricalNormalization, AttentionMapEncoder 
-from rsl_rl.networks.estimator import Velocity_Estimator
 
 class EncActorCritic(nn.Module):
     is_recurrent = False
@@ -27,7 +26,6 @@ class EncActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         embedding_dim=64,
-        velocity_estimation_enabled: bool = True,
         load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS,
         output_attention:bool=False,
         critic_encoder:bool=False,
@@ -55,7 +53,6 @@ class EncActorCritic(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
-        self.velocity_estimation_enabled = velocity_estimation_enabled
 
         # Encoder :
         # num_perception_obs = 0
@@ -67,26 +64,15 @@ class EncActorCritic(nn.Module):
                 scan_height_shape = obs[obs_group].shape # 
         self.embedding_dim = embedding_dim
 
-        if self.velocity_estimation_enabled:
-            self.last_estimated_velocity: torch.Tensor = None
-            self.history_estimated_velocity: torch.Tensor = None
 
-        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = self.velocity_estimation_enabled)
-        if self.critic_encoder:
-            print("use 2 encoder")
-            self.critic_encoder2 = AttentionMapEncoder(self.num_critic_obs,embedding_dim=embedding_dim,velocity_estimation_enabled = False)
-        else:
-            print("critic don't use a encoder")
+        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
         print(f"Encoder : {self.encoder}")
         # 这里obs为[env]
         self.horizon = scan_height_shape[1] 
         self.high_dim_obs_shape = scan_height_shape # [B,H,L,W,C]
         self.load_mask = load_mask  # 加载参数的mask
         self.output_attention = output_attention  # 是否输出attention 
-        if self.velocity_estimation_enabled:
-            embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs + 3)
-        else:
-            embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
+        embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
         if self.critic_encoder:
             embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_obs + d)]
         else:
@@ -172,9 +158,6 @@ class EncActorCritic(nn.Module):
         # print("AC_prop: ", prop_obs[0,0,...])
 
         embedding,_ = self.encoder(perception_obs,prop_obs,embedding_only=False)
-        if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,H,3]
-            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)] 残差连接
         # compute mean
         mean = self.actor(embedding_vec)
@@ -203,9 +186,6 @@ class EncActorCritic(nn.Module):
         # compute embedding 
         # 验证attention
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
-        if self.velocity_estimation_enabled:
-            self.last_estimated_velocity = embedding[...,-1,-3:]  # [B,1,3]
-            self.history_estimated_velocity = embedding[...,-3:]  # [B,H,3]
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
         action = self.actor(embedding_vec)
@@ -220,13 +200,9 @@ class EncActorCritic(nn.Module):
         low_dim_obs = self.critic_obs_normalizer(low_dim_obs)
         # TODO : 这里需要针对(B,H*d)的情况进行处理
         low_dim_query = low_dim_obs # [B,H,d] 假设是一样的，只不过不带噪声
-        # low_dim_query = low_dim_obs[:,:,self.critic_to_actor_mask]  # [B,H,d] for attention query
-        if self.critic_encoder:
-            embedding,_ = self.critic_encoder2(high_dim_obs,low_dim_query,embedding_only=True)
-            critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
-            critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
-        else:  
-            critic_obs = low_dim_obs.view(low_dim_obs.shape[0],-1)
+        embedding,_ = self.encoder(high_dim_obs,low_dim_query,embedding_only=True)
+        critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,d+d_obs]
+        critic_obs = critic_obs.view(critic_obs.shape[0], -1)  # [B,H*(d+d_obs)], gym style
         values = self.critic(critic_obs)
         return values
     
@@ -388,13 +364,3 @@ class EncActorCritic(nn.Module):
                 print("=== EncActorCritic : Load critic normalizer weights ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
-    def get_velocity_estimation(self)->torch.Tensor:
-        if self.velocity_estimation_enabled and self.last_estimated_velocity is not None:
-            return self.last_estimated_velocity
-        else:
-            return None
-    def get_history_velocity_estimation(self)->torch.Tensor:
-        if self.velocity_estimation_enabled and self.history_estimated_velocity is not None:
-            return self.history_estimated_velocity
-        else:
-            return None

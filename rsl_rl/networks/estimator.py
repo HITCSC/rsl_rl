@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+# TODO 不加入command，只用关节及action
 class Velocity_Estimator(nn.Module):
-    def __init__(self, history_len:int=3, d_obs:int=88,output_dim:int=3):
+    def __init__(self, history_len:int=3, d_obs:int=84,output_dim:int=3):
         """param input_dim: 输入维度
         :param hidden_dims: 隐藏层维度
         :param activation: 激活函数
@@ -27,5 +27,5 @@ class Velocity_Estimator(nn.Module):
         B = props.shape[0]
         H = props.shape[1]
         # 返回 [b,1,3]
-        actor_proprioception = props.view(B, H*props.shape[2])  # (B, H*input_dim)
+        actor_proprioception = props.reshape(B, H*props.shape[2])  # (B, H*input_dim)
         return self.estimator(actor_proprioception)
