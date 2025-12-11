@@ -217,6 +217,7 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            extra_batch,  # no use for vanilla PPO 
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]

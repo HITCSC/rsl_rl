@@ -34,6 +34,8 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            # for FPO and other Extensions : 
+            self.extra: TensorDict | None = None # add any field that you need for your algorithm
 
         def clear(self) -> None:
             self.__init__()
@@ -46,6 +48,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        extra_cfg: dict | None = None, # for FPO and other Extensions :
     ) -> None:
         self.training_type = training_type
         self.device = device
@@ -79,7 +82,18 @@ class RolloutStorage:
         # For RNN networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
-
+        
+        # for FPO and other Extensions
+        if (extra_cfg is not None):
+            # example of etra_cfg: {"epsilon":[N_mc,*action_shape], "t":[N_mc,]}
+            # key is self.extra's key, and value is the shape of the tensor for each transition 
+            self.extras = TensorDict(
+                {key: torch.zeros(num_transitions_per_env, num_envs,  *shape, device=device) for key, shape in extra_cfg.items()},
+                batch_size=[num_transitions_per_env, num_envs],
+                device=self.device,
+            )
+        else :
+            self.extras = None
         # Counter for the number of transitions stored
         self.step = 0
 
@@ -102,11 +116,17 @@ class RolloutStorage:
         if self.training_type == "rl":
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
-            self.mu[self.step].copy_(transition.action_mean)
-            self.sigma[self.step].copy_(transition.action_sigma)
+            if (transition.action_mean is not None):
+                # only use for Gaussian Policy
+                self.mu[self.step].copy_(transition.action_mean)
+                self.sigma[self.step].copy_(transition.action_sigma)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
+
+        # For FPO & other Extensions : 
+        if (transition.extra is not None):
+            self.extras[self.step].copy_(transition.extra)
 
         # Increment the counter
         self.step += 1
@@ -141,6 +161,10 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        # For Extras : 
+        extras = None 
+        if (self.extras is not None):
+            extras = self.extras.flatten(0,1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -158,6 +182,8 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                # for Extras : 
+                extra = None if extras is None else extras[batch_idx]
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
@@ -178,6 +204,7 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    extra,   # for FPO & other Extensions
                 )
 
     # For reinforcement learning with recurrent networks

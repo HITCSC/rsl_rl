@@ -119,7 +119,6 @@ class ActorCritic(nn.Module):
     @property
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
-
     def _update_distribution(self, obs: torch.Tensor) -> None:
         if self.state_dependent_std:
             # Compute mean and standard deviation

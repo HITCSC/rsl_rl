@@ -1,0 +1,74 @@
+runner:
+  class_name: OnPolicyRunner
+  # General
+  num_steps_per_env: 24  # Number of steps per environment per iteration
+  max_iterations: 1500  # Number of policy updates
+  seed: 1
+  # -- observations
+  obs_groups: {"policy": ["policy"], "critic": ["policy", "privileged"],"flow":["noise"]} # maps observation groups to types. See `vec_env.py` for more information
+  # -- logging parameters
+  save_interval: 50  # check for potential saves every `save_interval` iterations
+  experiment_name: walking_experiment
+  run_name: ""
+  # Logging writer
+  logger: tensorboard  # tensorboard, neptune, wandb
+  neptune_project: legged_gym
+  wandb_project: legged_gym
+  # -- for RolloutStorage
+  extra_cfg:
+    epsilon: [2, 26]  # make sure shape is [N_mc,Da]
+    t: [2,]
+
+  # Policy
+  policy:
+    class_name: FlowActorCritic
+    actor_obs_embbed_dim: 128
+    actor_obs_encoder_dims: [256,256]
+    actor_obs_activation: elu 
+    actor_obs_normalization: true
+    critic_obs_normalization: true
+    critic_hidden_dims: [256, 256, 256]
+    # for flow matching 
+    flow_embed_dim: 64
+    flow_hidden_dims: [128, 128,128]
+    flow_activation: swish
+    flow_parameterization: velocity
+    flow_solver_step_size: 0.1 
+    flow_zero_action_input: false
+    flow_schedule: linear 
+    flow_intergrator: euler 
+
+  # Algorithm
+  algorithm:
+    class_name: FPO
+    # Training
+    learning_rate: 0.001
+    num_learning_epochs: 5
+    num_mini_batches: 4  # mini batch size = num_envs * num_steps / num_mini_batches
+    # Value function
+    value_loss_coef: 1.0
+    clip_param: 0.2
+    use_clipped_value_loss: true
+    # Surrogate loss
+    gamma: 0.99
+    lam: 0.95
+    max_grad_norm: 1.0
+    # Miscellaneous
+    normalize_advantage_per_mini_batch: false
+    N_mc: 2 # make sure is same as extra_cfg
+
+    # Symmetry augmentation
+    symmetry_cfg:
+      use_data_augmentation: true  # This adds symmetric trajectories to the batch
+      use_mirror_loss: false  # This adds symmetry loss term to the loss function
+      data_augmentation_func: null # String containing the module and function name to import
+      # Example: "legged_gym.envs.locomotion.anymal_c.symmetry:get_symmetric_states"
+      #
+      # .. code-block:: python
+      #
+      #     @torch.no_grad()
+      #     def get_symmetric_states(
+      #        obs: Optional[torch.Tensor] = None, actions: Optional[torch.Tensor] = None, cfg: "BaseEnvCfg" = None, obs_type: str = "policy"
+      #     ) -> Tuple[torch.Tensor, torch.Tensor]:
+      #
+      mirror_loss_coeff: 0.0 # Coefficient for symmetry loss term. If 0, no symmetry loss is used

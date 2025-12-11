@@ -11,13 +11,14 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import PPO,FPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
     ActorCriticRecurrent,
     EncActorCritic,
+    FlowActorCritic,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
@@ -247,7 +248,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | FPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config if used
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -269,18 +270,20 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | EncActorCritic = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        actor_critic: (
+            ActorCritic | ActorCriticRecurrent | ActorCriticCNN | EncActorCritic | FlowActorCritic
+        ) = actor_critic_class(obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg).to(self.device)
 
         # Initialize the storage
+        # TODO : 这里可能有更好的方式来进行初始化设置 
+        extra_cfg = None if "extra_cfg" not in self.cfg.keys() else self.cfg["extra_cfg"]
         storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device, extra_cfg
         )
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(
+        alg: PPO|FPO = alg_class(
             actor_critic, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
