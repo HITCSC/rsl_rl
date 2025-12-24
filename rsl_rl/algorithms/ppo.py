@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic,EncActorCritic, EncVelActorCritic
+from rsl_rl.modules import ActorCritic,EncActorCritic, EncVelActorCritic, EncDreamWAQActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic|EncActorCritic | EncVelActorCritic
+    policy: ActorCritic|EncActorCritic | EncVelActorCritic | EncDreamWAQActorCritic
     """The actor critic module."""
 
     def __init__(
@@ -43,6 +43,7 @@ class PPO:
         velocity_estimation_enabled: bool = False,
         velocity_loss_coef=0.5,
         cnt = 0,
+        use_CENet: bool = True,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -53,6 +54,8 @@ class PPO:
         # device-related parameters
         self.cnt = cnt
         self.use_estimated_vel = False
+        self.use_CENet = use_CENet
+        print("PPO use_CENet:", self.use_CENet)
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
@@ -203,7 +206,8 @@ class PPO:
             mean_velocity_loss = 0
         else:
             mean_velocity_loss = None
-
+        if self.use_CENet:
+            mean_CENet_loss = 0
         # generator for mini batches
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -379,12 +383,16 @@ class PPO:
                 base_lin_vel_last_time = privileged_obs[...,-1,:3] 
                 # print("all_privileged_obs",privileged_obs[0,-1,...])
                 # print("all_policy_obs",policy_obs[0,-1,...])
-                print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
-                print("batch 0: estimated_velocity:", velocity_network[0])
+                # print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
+                # print("batch 0: estimated_velocity:", velocity_network[0])
                 # print("privileged_obs shape:", privileged_obs.shape)
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
                 loss += self.velocity_loss_coef * velocity_loss
                 mean_velocity_loss += velocity_loss.item()
+            if self.use_CENet:
+                CENet_loss = self.policy.get_CENet_loss()
+                loss += CENet_loss
+                mean_CENet_loss += CENet_loss.item()
             # Random Network Distillation loss
             # TODO: Move this processing to inside RND module.
             if self.rnd:
@@ -456,17 +464,20 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if self.velocity_estimation_enabled:
-            mean_velocity_loss /= num_updates
-            # TODO 判断何时使用估计速度作为观测速度
-            if mean_velocity_loss < 0.5 :
-                self.cnt += 1
-                if self.cnt > 10:
-                    # print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
-                    self.use_estimated_vel = True
-            else:
-                self.cnt = 0
-            loss_dict["velocity_loss"] = mean_velocity_loss
+        if self.use_CENet:
+            mean_CENet_loss /= num_updates
+            loss_dict["CENet_loss"] = mean_CENet_loss
+        # if self.velocity_estimation_enabled:
+        #     mean_velocity_loss /= num_updates
+        #     # TODO 判断何时使用估计速度作为观测速度
+        #     if mean_velocity_loss < 0.5 :
+        #         self.cnt += 1
+        #         if self.cnt > 10:
+        #             # print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
+        #             self.use_estimated_vel = True
+        #     else:
+        #         self.cnt = 0
+        #     loss_dict["velocity_loss"] = mean_velocity_loss
         return loss_dict
 
     """

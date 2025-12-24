@@ -6,12 +6,11 @@ from torch.distributions import Normal
 from tensordict import TensorDict 
 from rsl_rl.networks import MLP, EmpiricalNormalization, AttentionMapEncoder 
 from rsl_rl.networks.estimator import Velocity_Estimator
-from rsl_rl.networks.estimator import Velocity_Estimator
 from rsl_rl.networks.CENet import CENet
 # 为了actor and critic复用encoder —— 解耦速度估计器  将速度估计3dim输入到 act中\
 # 有很多shit代码：由于先update_actor_obs_norm再拼接速度，可能存在问题
 # 且输出单帧数据
-class EncVelActorCritic(nn.Module):
+class EncDreamWAQActorCritic(nn.Module):
     is_recurrent = False
     LOAD_POLICY_WEIGHTS = 1
     LOAD_CRITIC_WEIGHTS = 2
@@ -228,8 +227,6 @@ class EncVelActorCritic(nn.Module):
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
-        if self.use_CENet:
-            embedding_vec = torch.cat([embedding_vec, self.z], dim=-1)
         action = self.actor(embedding_vec)
         if (self.output_attention):
             return action,attention

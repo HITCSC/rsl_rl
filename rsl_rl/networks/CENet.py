@@ -7,7 +7,7 @@ import numpy as np
 
 class CENet(nn.Module):
     def __init__(self, 
-                 n_features: int = 18,  # o_t的特征数
+                 n_features: int = 84,  # o_t的特征数
                  H: int = 5,             # 时间窗口长度
                  latent_dim: int = 48,   # 潜在向量z_t的维度
                  beta: float = 1.0,      # β-VAE的β参数
@@ -54,7 +54,7 @@ class CENet(nn.Module):
         """
         batch_size = x.shape[0]
         # 展平输入：(batch_size, H*n_features)
-        x_flat = x.view(batch_size, -1)
+        x_flat = x.reshape(batch_size, -1)  # <- 不要求contiguous；必要时会拷贝
         # 共享编码器特征提取
         features = self.encoder(x_flat)
         # 输出高斯分布参数
