@@ -41,7 +41,7 @@ class EncDreamWAQActorCritic(nn.Module):
     ):
         if kwargs:
             print(
-                "EncVelActorCritic.__init__ got unexpected arguments, which will be ignored: "
+                "EncDreamWAQActorCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
@@ -50,12 +50,12 @@ class EncDreamWAQActorCritic(nn.Module):
         actor_obs_shape = []
         num_actor_obs = 0  # obervation dimensions in 1 stamp for the actor
         for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) > 2, "The EncVelActorCritic module only supports obs shape [B,H,d,...]. "
+            assert len(obs[obs_group].shape) > 2, "The EncDreamWAQActorCritic module only supports obs shape [B,H,d,...]. "
             "for IsaacLab, you need to make sure that flatten_history_dim is False."
             num_actor_obs += obs[obs_group].shape[-1]
         num_critic_obs = 0 # obervation dimensions in 1 stamp for the critic 
         for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) > 2, "The EncVelActorCritic module only supports obs shape [B,H,d,...]. "
+            assert len(obs[obs_group].shape) > 2, "The EncDreamWAQActorCritic module only supports obs shape [B,H,d,...]. "
             "for IsaacLab, you need to make sure that flatten_history_dim is False."
             num_critic_obs += obs[obs_group].shape[-1]
         self.num_actor_obs = num_actor_obs
@@ -96,6 +96,7 @@ class EncDreamWAQActorCritic(nn.Module):
             self.CENet = CENet(n_features=84,H=4,latent_dim=self.lantent_dim,beta=1.0,v_dim=3)
             self.z = None
             self.v_est = None
+            self.cenet_target_slice = slice(7, 7 + 84)
             print("Use CENet for representation learning.")
             print(f"CENet: {self.CENet}")
 
@@ -197,7 +198,7 @@ class EncDreamWAQActorCritic(nn.Module):
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)] 
         #拼接latent到embedding_vec
         if self.use_CENet:
-            embedding_vec = torch.cat([embedding_vec, self.z], dim=-1)  # [B, H*(d+d_obs) + latent_dim]
+            embedding_vec = torch.cat([embedding_vec, self.z.detach()], dim=-1)  # [B, H*(d+d_obs) + latent_dim]
         # compute mean
         mean = self.actor(embedding_vec)
         # compute standard deviation
@@ -227,6 +228,8 @@ class EncDreamWAQActorCritic(nn.Module):
         embedding,attention = self.encoder(high_dim_obs,low_dim_obs,embedding_only=False)
         embedding_vec = embedding.view(embedding.shape[0], -1)  # [B,H*(d+d_obs)], gym style 
         # compute mean
+        if self.use_CENet:
+            embedding_vec = torch.cat([embedding_vec, self.z.detach()], dim=-1)  # [B, H*(d+d_obs) + latent_dim]
         action = self.actor(embedding_vec)
         if (self.output_attention):
             return action,attention
@@ -248,6 +251,18 @@ class EncDreamWAQActorCritic(nn.Module):
         values = self.critic(critic_obs)
         return values
     
+    def compute_CENet_loss(self, obs:TensorDict)->dict:
+        """在PPO update阶段对mini-batch现算CENet loss（避免使用act阶段缓存图）。"""
+        if not getattr(self, "use_CENet", False):
+            return torch.zeros((), device=next(self.parameters()).device)
+
+        # 这里复用 get_actor_obs 的逻辑：它会计算 self.CENet_loss
+        _low_dim_obs, _high_dim_obs = self.get_actor_obs(obs,train_cenet=True)
+        # 保证返回是标量tensor
+        return self.CENet_loss
+
+
+
     def _gym_to_lab(self,obs:torch.Tensor,horizon:int,keep_dim=False)->torch.Tensor:
         """
         Brief:
@@ -295,7 +310,7 @@ class EncDreamWAQActorCritic(nn.Module):
         else:
             return obs.view(B, d, horizon).permute(0, 2, 1)  # [B,H,d]
 
-    def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
+    def get_actor_obs(self, obs:TensorDict,style:str='lab',train_cenet :bool = False)->tuple:
         """
         :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
         :param style : 'lab' or 'gym', for lab style obs the permutation is 
@@ -305,14 +320,6 @@ class EncDreamWAQActorCritic(nn.Module):
         """
         obs_list = []
         for obs_group in self.obs_groups["policy"]:
-            # command & policy
-            # 这里假设每个group的历史堆叠形式是gym style的
-            # if style == 'lab':
-            #     gym_obs = self._lab_to_gym(obs[obs_group], self.horizon,keep_dim=False)  # [B,H,d]
-            #     obs_list.append(gym_obs)
-            # else:
-            #     B = obs[obs_group].shape[0]
-            #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
             obs_list.append(obs[obs_group]) # [B,H,d_i]
         low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
         
@@ -320,21 +327,50 @@ class EncDreamWAQActorCritic(nn.Module):
         for obs_group in self.obs_groups["perception"]:
             high_dim_obs_list.append(obs[obs_group])
         high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
+
+        low_dim_obs_new = low_dim_obs
         # 前4时刻作为CENet_input,当前作为监督信号
         if self.use_CENet:
-            B = low_dim_obs.shape[0]
-            H = low_dim_obs.shape[1]
-            #输入前4个history
-            input_CE = low_dim_obs[:,:H-1,7:].clone()  # [B,H-1,d-7] 去除速度及command
-            v_true = low_dim_obs[:,-1,4:7].clone()  # [B,3]
-            o_next_true = low_dim_obs[:,-1,7:].clone()  # [B,d]
-            CENet_outputs = self.CENet(input_CE,v_true=v_true, o_next_true=o_next_true) 
+            B, H, d = low_dim_obs.shape
+            ce_h = self.CENet.H
+            if H < ce_h + 1:
+                raise RuntimeError(f"History length H={H} 不足以支持CENet: 需要至少 {ce_h+1} 帧")
+
+            # 输入：来自policy_obs（去除速度&command）
+            input_CE = low_dim_obs[:, :ce_h, 7:].clone()  # [B,ce_h,84]（确保你的7:后实际是84）
+
+            # 监督：来自critic/privileged（真实速度 + 真实下一帧状态子集）
+            if "privileged" not in obs:
+                raise KeyError("use_CENet=True 但 obs 中没有 'privileged'，无法构造CENet监督信号")
+            obs_list_c = []
+            for obs_group in self.obs_groups["critic"]:
+                obs_list_c.append(obs[obs_group]) # [B,H,d_i]
+            priv = torch.cat(obs_list_c, dim=-1)  # [B,H,d]
+            # v_true：真实 base_lin_vel
+            v_true = priv[:, ce_h, 4:7].clone()  # [B,3]  (t时刻)
+
+            # o_next_true：privileged 中选取84维（你需要保证该slice长度=84）
+            o_next_true = priv[:, ce_h, self.cenet_target_slice].clone()  # [B,84]
+            if train_cenet:
+                CENet_outputs = self.CENet(input_CE, v_true=v_true, o_next_true=o_next_true)
+                self.CENet_loss = CENet_outputs["total_loss"]
+            else:
+                with torch.no_grad():
+                    CENet_outputs = self.CENet(input_CE)  # 只要z/v_est就行（forward里需支持无监督分支）
+            self.v_est = CENet_outputs["v_est"].unsqueeze(1)
+            self.z = CENet_outputs["z"]
+            CENet_outputs = self.CENet(input_CE, v_true=v_true, o_next_true=o_next_true)
             self.v_est = CENet_outputs["v_est"].unsqueeze(dim=1)  # [B,1,3]
             self.z = CENet_outputs["z"]
             self.CENet_loss = CENet_outputs["total_loss"]
-            low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
-            low_dim_obs_new[:, :, 4:7] = self.v_est
-            high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
+
+            # actor 输入只用当前帧，并用 v_est 替换速度
+            low_dim_cur = low_dim_obs[:, ce_h, :].unsqueeze(dim=1).clone()  # [B,1,d]
+            low_dim_obs_new = torch.cat(
+                [low_dim_cur[:, :, :4], self.v_est, low_dim_cur[:, :, 7:]],
+                dim=-1,
+            )
+
             # latent是直接输入MHA还是输入actor？ dreamwaq是作为原始观测代替输入的——1.直接代替prop与map_encoding拼接； 2.直接把latent输入mha
         if self.dis_vel_estimator:
             B = low_dim_obs.shape[0]
@@ -432,39 +468,39 @@ class EncDreamWAQActorCritic(nn.Module):
         if self.load_mask & self.LOAD_POLICY_WEIGHTS:
             actor_state_dict = {k.replace('actor.', '',1): v for k, v in state_dict.items() if k.startswith('actor.')}
             self.actor.load_state_dict(actor_state_dict, strict=strict)
-            print("=== EncVelActorCritic : Load Actor Weights ===")
+            print("=== EncDreamWAQActorCritic : Load Actor Weights ===")
             # TODO : 这里需要确认一下, 是否需要加载std的参数
         if self.load_mask & self.LOAD_CRITIC_WEIGHTS:
             critic_state_dict = {k.replace('critic.', '',1): v for k, v in state_dict.items() if k.startswith('critic.')}
             self.critic.load_state_dict(critic_state_dict, strict=strict)
-            print("=== EncVelActorCritic : Load Critic Weights ===")
+            print("=== EncDreamWAQActorCritic : Load Critic Weights ===")
         if self.load_mask & self.LOAD_ENCODER_WEIGHTS:
             enc_state_dict = {k.replace('encoder.', '',1): v for k, v in state_dict.items() if k.startswith('encoder.')}
             self.encoder.load_state_dict(enc_state_dict, strict=strict)
-            print("=== EncVelActorCritic : Load Encoder Weights ===")
+            print("=== EncDreamWAQActorCritic : Load Encoder Weights ===")
         # 这里还需要load normalization的参数
         if (self.load_mask & self.LOAD_NORMALIZER_WEIGHTS):
             # if (self.actor_obs_normalization) and ('actor_obs_normalizer' in state_dict):
             if (self.actor_obs_normalization):
                 act_obs_norm_state_dict = {k.replace('actor_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('actor_obs_normalizer.')}
                 self.actor_obs_normalizer.load_state_dict(act_obs_norm_state_dict)
-                print("=== EncVelActorCritic : Load actor normalizer weights ===")
+                print("=== EncDreamWAQActorCritic : Load actor normalizer weights ===")
             # if (self.critic_obs_normalization) and ('critic_obs_normalizer' in state_dict):
             if (self.critic_obs_normalization):
                 critic_obs_norm_state_dict = {k.replace('critic_obs_normalizer.', '',1): v for k, v in state_dict.items() if k.startswith('critic_obs_normalizer.')}
                 self.critic_obs_normalizer.load_state_dict(critic_obs_norm_state_dict)
-                print("=== EncVelActorCritic : Load critic normalizer weights ===")
+                print("=== EncDreamWAQActorCritic : Load critic normalizer weights ===")
         if self.load_mask & self.LOAD_VELOCITY_WEIGHTS:
             vel_state_dict = {k.replace('velocity_estimator.', '',1): v for k, v in state_dict.items() if k.startswith('velocity_estimator.')}
             self.velocity_estimator.load_state_dict(vel_state_dict, strict=strict)
-            print("=== EncVelActorCritic : Load Velocity Estimator Weights ===")
+            print("=== EncDreamWAQActorCritic : Load Velocity Estimator Weights ===")
         if self.use_CENet and (self.load_mask & self.LOAD_CENET_WEIGHTS):
             cenet_state_dict = {k.replace('CENet.', '', 1): v for k, v in state_dict.items() if k.startswith('CENet.')}
             if len(cenet_state_dict) > 0:
                 self.CENet.load_state_dict(cenet_state_dict, strict=strict)
-                print("=== EncVelActorCritic : Load CENet Weights ===")
+                print("=== EncDreamWAQActorCritic : Load CENet Weights ===")
             else:
-                print("=== EncVelActorCritic : No CENet weights found in checkpoint ===")
+                print("=== EncDreamWAQActorCritic : No CENet weights found in checkpoint ===")
         # super().load_state_dict(state_dict, strict=strict)
         return True  # training resumes
     def get_velocity_estimation(self)->torch.Tensor:

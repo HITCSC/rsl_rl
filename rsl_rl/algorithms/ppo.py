@@ -103,8 +103,23 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
-        # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+
+        # Create optimizer (exclude CENet params)
+        if self.use_CENet and hasattr(self.policy, "CENet"):
+            ppo_params = []
+            for name, p in self.policy.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.startswith("CENet."):
+                    continue
+                ppo_params.append(p)
+            self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
+
+            # 新增：CENet独立优化器
+            self.cenet_optimizer = optim.Adam(self.policy.CENet.parameters(), lr=learning_rate * 0.5)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+            self.cenet_optimizer = None
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -389,10 +404,11 @@ class PPO:
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
                 loss += self.velocity_loss_coef * velocity_loss
                 mean_velocity_loss += velocity_loss.item()
+
+            # CENet loss：单独优化（不加入PPO总loss）
             if self.use_CENet:
-                CENet_loss = self.policy.get_CENet_loss()
-                loss += CENet_loss
-                mean_CENet_loss += CENet_loss.item()
+                CENet_loss = self.policy.compute_CENet_loss(obs_batch)
+                mean_CENet_loss += float(CENet_loss.detach().item())
             # Random Network Distillation loss
             # TODO: Move this processing to inside RND module.
             if self.rnd:
@@ -410,12 +426,18 @@ class PPO:
 
             # Compute the gradients
             # -- For PPO
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
             # -- For RND
             if self.rnd:
-                self.rnd_optimizer.zero_grad()  # type: ignore
+                self.rnd_optimizer.zero_grad(set_to_none=True)  # type: ignore
                 rnd_loss.backward()
+
+            # -- For CENet (independent)
+            if self.use_CENet and self.cenet_optimizer is not None:
+                self.cenet_optimizer.zero_grad(set_to_none=True)
+                CENet_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -425,9 +447,15 @@ class PPO:
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
+
+            # -- For CENet
+            if self.use_CENet and self.cenet_optimizer is not None:
+                nn.utils.clip_grad_norm_(self.policy.CENet.parameters(), self.max_grad_norm)
+                self.cenet_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()

@@ -298,6 +298,8 @@ class EncVelActorCritic(nn.Module):
         else:
             return obs.view(B, d, horizon).permute(0, 2, 1)  # [B,H,d]
 
+        
+
     def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
         """
         :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
@@ -330,6 +332,7 @@ class EncVelActorCritic(nn.Module):
             #输入前4个history
             input_CE = low_dim_obs[:,:H-1,7:].clone()  # [B,H-1,d-7] 去除速度及command
             v_true = low_dim_obs[:,-1,4:7].clone()  # [B,3]
+            # 监督信号错误：需要用特权观测
             o_next_true = low_dim_obs[:,-1,7:].clone()  # [B,d]
             CENet_outputs = self.CENet(input_CE,v_true=v_true, o_next_true=o_next_true) 
             self.v_est = CENet_outputs["v_est"].unsqueeze(dim=1)  # [B,1,3]

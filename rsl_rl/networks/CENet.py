@@ -77,7 +77,7 @@ class CENet(nn.Module):
         v_est = self.decoder_velocity(z)
         o_recon = self.decoder_reconstruct(z)
         return v_est, o_recon
-
+    
     def forward(self, 
                 x: torch.Tensor, 
                 v_true: torch.Tensor = None, 
