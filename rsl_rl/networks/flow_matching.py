@@ -92,9 +92,10 @@ class FlowMatchingModel(nn.Module):
         embedded_dim: int,  # FiLM/AdaLN embedding dimension
         mlp_dims: tuple[int] | list[int] = [256, 256, 256],
         activation: str = "swish",
-        parameterization: str ="velocity",  # flow matching parameterization ("velocity", "data")
+        parameterization: str ="velocity",  # flow matching parameterization ("velocity", "data","epsilon")
         solver_step_size=0.1,  # for ODE Solver 
         zero_action_input: bool = False,  # albation for action cond, 但是不知道什么用
+        sigma: float = 0.2,  # for CFM smoothing
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
@@ -121,6 +122,7 @@ class FlowMatchingModel(nn.Module):
         # TODO : adaLN会破坏等变性,这里或许换成FiLM有可能更好
         self.actor_norm = adaLN(embedded_dim)
         self.post_adaln_non_linearity = nn.SiLU()
+        # for epsilon pred & x-pred, the initialization must be different : 
         self.proj = layer_init(nn.Linear(embedded_dim, action_dim), std=0.01) # after FiLM/AdaLN, project to action space
         # self.proj = nn.Linear(embedded_dim, action_dim)  
         
@@ -132,6 +134,7 @@ class FlowMatchingModel(nn.Module):
         self.parameterization = parameterization
         self.solver_step_size = solver_step_size
         self.zero_action_input = zero_action_input
+        self.sigma = sigma  # for CFM Smoothing , avoid gradient explosion
 
 
     def forward(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -179,7 +182,7 @@ class FlowMatchingModel(nn.Module):
         device = obs.device
         batch_shape = obs.shape[:-1]
         B = obs.shape[0]
-        time_grid = torch.tensor([0.0, 1.0], device=device)
+        time_grid = torch.tensor([0.0, 1.0], device=device)  # for epsilon pred , [0,1] ODE会有奇异
         if noise is None:
             # 这里可以尝试放宽一些限制
             x_0 = torch.randn(*batch_shape, self.action_dim, device=device)
@@ -199,6 +202,13 @@ class FlowMatchingModel(nn.Module):
             elif self.parameterization == "data":
                 x1 = hidden
                 velocity = self.path.target_to_velocity(x_1=x1, x_t=x, t=t_batch.unsqueeze(-1))
+            elif self.parameterization == "epsilon":
+                epsilon = hidden
+                velocity = self.path.epsilon_to_velocity(
+                    epsilon=epsilon, x_t=x, t=t_batch.unsqueeze(-1))
+            else:
+                raise ValueError(f"Unknown parameterization {self.parameterization}")
+
             return velocity
 
         x_1 = self.solver.sample(
@@ -230,7 +240,6 @@ class FlowMatchingModel(nn.Module):
             t: [batch,] timesteps associated with eps samples.
             mode: Either 'u' or 'u_but_supervise_as_eps'.
         TODO:
-            add equaivarient Loss 
         """
         while obs.dim() < noise.dim():
             obs = obs.unsqueeze(1)
@@ -241,13 +250,20 @@ class FlowMatchingModel(nn.Module):
         pred = self.forward(obs, x_t, t)
         if self.parameterization == "velocity":
             x1 = self.path.velocity_to_target(x_t=x_t,velocity=pred,t=t.unsqueeze(-1))
-            # TODO : 这里sigma应该作为超参数, 防止ratio爆炸,源代码给出的0.05直接爆了，但是现在这个参数也需要配合log ratio上的clip才能比较正常
-            log_probs = -((u_t - pred) ** 2) / (2 * 0.05 ** 2)
+            log_probs = -((u_t - pred) ** 2) / (2 * self.sigma ** 2)
             loss = - log_probs.reshape(-1).mean()
         elif self.parameterization == "data":
             x1 = pred 
-            log_probs = -((x1 - actions) ** 2) / (2 * 0.05 ** 2)
+            log_probs = -((x1 - actions) ** 2) / (2 * self.sigma ** 2)
             loss = - log_probs.reshape(-1).mean()
+        elif self.parameterization == "epsilon":
+            epsilon_pred = pred
+            # 真实 epsilon 就是传入的 noise (x_0)
+            log_probs = -((epsilon_pred - noise) ** 2) / (2 * self.sigma ** 2)
+            loss = -log_probs.reshape(-1).mean()
+        else:
+            raise ValueError(f"Unknown parameterization {self.parameterization}")
+
         # (TODO) Mean bound loss
         # if self.training:
             # self.mean_bound_loss = self.bound_loss(x1)

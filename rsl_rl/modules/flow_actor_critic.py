@@ -44,6 +44,7 @@ class FlowActorCritic(nn.Module):
         flow_zero_action_input: bool = False,
         flow_schedule: str = "linear",
         flow_integrator: str = "euler",
+        flow_smooth_factor : float = 0.2,  # smooth & exploration factor for the flow matching
         # average_losses_before_exp: bool = True,  # If True, mean CFM loss over samples before exponentiating (lower variance ratio).
         **kwargs: dict[str, Any],
     ) -> None:
@@ -88,10 +89,14 @@ class FlowActorCritic(nn.Module):
             activation=flow_activation,
             parameterization=flow_parameterization,
             solver_step_size=flow_solver_step_size,
-            zero_action_input=flow_zero_action_input
+            zero_action_input=flow_zero_action_input,
+            sigma=flow_smooth_factor,
         )
         # perturbation
-        self.perturb_action_std = -0.05 
+        if (flow_parameterization == "data"):
+            self.perturb_action_std = flow_smooth_factor
+        else:
+            self.perturb_action_std = None 
 
         # Observation normalization for actor and critic.
         self.actor_obs_normalization = actor_obs_normalization
@@ -155,6 +160,16 @@ class FlowActorCritic(nn.Module):
             action = action + torch.randn_like(action) * std
         return action
     
+    def act_inference(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+        actor_obs = self.get_actor_obs(obs)
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        # obs_embed = self.obs_encoder(actor_obs)
+        obs_embed = actor_obs
+        # get prior 
+        prior = obs[self.obs_groups["flow"][0]]  # prior noise of the flow
+        action = self._sample_flow_action(obs_embed, prior)
+        return action
+    
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         critic_obs = self.get_critic_obs(obs)
         critic_obs = self.critic_obs_normalizer(critic_obs)
@@ -189,9 +204,10 @@ class FlowActorCritic(nn.Module):
         pred = self.flow.forward(obs_embed_expand,x_t,stamps_expand)  # compute velocity/data 
         return pred.view(*noise.shape)
 
-    def compute_cfm_loss(self,obs:TensorDict,action:torch.Tensor, noise:torch.Tensor,stamps:torch.Tensor) -> torch.Tensor:
+    def compute_cfm_loss(self,obs:TensorDict,action:torch.Tensor, noise:torch.Tensor,stamps:torch.Tensor,return_log_prob=True) -> torch.Tensor:
         """
         计算Condiontional Flow Matching Loss, 用于计算ELBO
+        :param action: shape = [B,Da]
         :param noise: 预采样好的噪声,shape = [B, N_mc, Da]
         :param timestamp: 要计算的timestamp,shape = [B, N_mc,]
         :return: ELBO, shape = [B,1] \frac{1}{N_mc}\sum l_\theta(\tau_i,\epsilon_i)
@@ -201,21 +217,41 @@ class FlowActorCritic(nn.Module):
         actor_obs = self.actor_obs_normalizer(actor_obs)
         # obs_embed = self.obs_encoder(actor_obs)
         obs_embed = actor_obs
-        N_mc = 1
-        batch_size = noise.shape[0]
-        if (action.dim() != noise.dim()):
-            N_mc = noise.shape[1]
-        obs_embed_expand = obs_embed.repeat(N_mc,1)  # shape = [N_mc*B,Do]
-        action_expand = action.repeat(N_mc,1)  # shape = [N_mc*B,Da]
-        # noise -> [B*N_mc,Da]
-        noise_expand = noise.view(-1,*noise.shape[2:])
-        stamps_expand = stamps.view(-1)  # [B*N,]
-        _,elbo = self.flow.compute_cfm_loss(
+
+        B = obs_embed.shape[0]
+        if action.dim() == noise.dim():   # [B, Da] vs [B, Da] => N_mc = 1
+            N_mc = 1
+        else:
+            N_mc = noise.shape[1]         # noise: [B, N_mc, Da]
+
+        # obs: [B, Do] -> [B, N_mc, Do] -> [B*N_mc, Do]
+        obs_embed_expand = obs_embed[:, None, :].expand(B, N_mc, -1).reshape(B * N_mc, -1)
+
+        # action: [B, Da] -> [B, N_mc, Da] -> [B*N_mc, Da]
+        action_expand = action[:, None, :].expand(B, N_mc, -1).reshape(B * N_mc, -1)
+
+        # noise: [B, N_mc, Da] -> [B*N_mc, Da]
+        noise_expand = noise.reshape(B * N_mc, -1)
+
+        # stamps: [B, N_mc] -> [B*N_mc]
+        stamps_expand = stamps.reshape(B * N_mc)
+        # N_mc = 1
+        # batch_size = noise.shape[0]
+        # if (action.dim() != noise.dim()):
+        #     N_mc = noise.shape[1]
+        # obs_embed_expand = obs_embed.repeat(N_mc,1)  # shape = [N_mc*B,Do]
+        # action_expand = action.repeat(N_mc,1)  # shape = [N_mc*B,Da]
+        # # noise -> [B*N_mc,Da]
+        # noise_expand = noise.view(-1,*noise.shape[2:])
+        # stamps_expand = stamps.view(-1)  # [B*N,]
+        loss, elbo = self.flow.compute_cfm_loss(
             obs_embed_expand,action_expand,noise_expand,stamps_expand
         )
-        # print("elbo:",torch.isnan(elbo).all())
-        elbo = elbo.view(batch_size,N_mc,1)
-        return elbo.mean(dim=1) 
+        if (return_log_prob):
+            elbo = elbo.view(B,N_mc,1)
+            return elbo.mean(dim=1) 
+        else:
+            return loss
 
     def sample_noise_t(self,action:torch.Tensor,N_mc:int=1)->TensorDict:
         """
@@ -233,6 +269,17 @@ class FlowActorCritic(nn.Module):
             batch_size=[B],
             device=action.device
         )
+        return result
+    
+    def sample_t(self,action:torch.Tensor,)->torch.Tensor:
+        """
+        预采样时间步, 用于计算CFM Loss/ELBO
+        :param action: 动作,shape = [B, Da]
+        :param Nmc: 采样数量
+        :return: 时间步,shape = [B,]
+        """
+        B = action.shape[0]
+        result = self.distribtion_t.sample((B,)).to(action.device)
         return result
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:

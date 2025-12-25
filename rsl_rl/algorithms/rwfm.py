@@ -1,4 +1,6 @@
-
+"""
+Reward Weighted Flow Matching (RWFM)
+"""
 from __future__ import annotations
 
 import torch
@@ -11,7 +13,7 @@ from rsl_rl.utils import string_to_callable
 from rsl_rl.utils.logger import Logger 
 
 
-class FPO:
+class RWFM:
     """Flow Policy Gradient algorithm adapted to the RSL-RL interface."""
 
     policy: FlowActorCritic
@@ -26,7 +28,6 @@ class FPO:
         gamma: float = 0.99,
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
-        # entropy_coef: float = 0.0,  # not support now 
         learning_rate: float = 3e-4,
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
@@ -35,7 +36,8 @@ class FPO:
         symmetry_cfg: dict | None = None,
         multi_gpu_cfg: dict | None = None,
         # for Flow Matching 
-        N_mc : int = 1,  # number of MC samples for ELBO clac 
+        # N_mc : int = 1,  # number of MC samples for ELBO clac 
+        awr_factor: float = 0.1,
         **kwargs 
     ) -> None:
         # Device-related parameters
@@ -93,7 +95,7 @@ class FPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         # for FPO hyerparameters : 
-        self.N_mc = N_mc # number of Monte Carlo samples for CFM Loss calc 
+        self.awr_factor = awr_factor
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         # Flow policy returns action and auxiliary flow info.
@@ -102,7 +104,7 @@ class FPO:
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.observations = obs
         # for flow matching :
-        self.transition.extra = self.policy.sample_noise_t(actions.detach(),N_mc=self.N_mc) 
+        self.transition.extra = self.policy.sample_noise_t(actions.detach(),N_mc=1)
         self.transition.actions_log_prob = self.policy.compute_cfm_loss(obs, 
                                                                         actions,
                                                                         self.transition.extra["epsilon"],
@@ -153,58 +155,11 @@ class FPO:
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0.0
-        mean_surrogate_loss = 0.0
-        mean_ratio = 0.0 
+        mean_awr_loss = 0.0
+        mean_cfm_loss = 0.0 
         # mean_entropy = 0.0
         mean_symmetry_loss = 0 if self.symmetry else None
-        mean_cfm_loss = 0.0  # evalute CFM Loss   
-        max_delta_action = 0.0 # evaluate delta action for phase 1 finetuning 
-        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        # Phase 1 : Here we first finetuning the policy to decrease the CFM Loss for more lipschitz velocity field :
-        for (
-            obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hidden_states_batch,
-            masks_batch,
-            extra_batch,  # for FPO, record eps & timestamps 
-        ) in generator:
-            # TODO : add equavariance loss here
-            num_phase1_updates = 2
-            for i in range(num_phase1_updates):
-                cfm_t = self.policy.sample_t(actions_batch)
-                opt_cfm_loss = self.policy.compute_cfm_loss(obs_batch, actions_batch,
-                                                                obs_batch[self.policy.obs_groups["flow"][0]],
-                                                                cfm_t,return_log_prob=False)
-                # value_batch = self.policy.evaluate(obs_batch)
-                # if self.use_clipped_value_loss:
-                #     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                #         -self.clip_param, self.clip_param
-                #     )
-                #     value_losses = (value_batch - returns_batch).pow(2)
-                #     value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                #     value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                # else:
-                #     value_loss = (returns_batch - value_batch).pow(2).mean()
-                phase_1_loss = opt_cfm_loss
-                self.optimizer.zero_grad()
-                phase_1_loss.backward()
-                if self.is_multi_gpu:
-                    self.reduce_parameters()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                            
-            # test phase 1 
-            test_act = self.policy.act(obs_batch)
-            delta_action = (test_act - actions_batch).norm(dim=-1).max().item()
-            max_delta_action = max_delta_action if max_delta_action > delta_action else delta_action
 
-        # Phase 2 : Update Actor - Critic via Advantage Actor-Critic
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
             obs_batch,
@@ -230,6 +185,7 @@ class FPO:
             
             # Perform symmetric augmentation
             symmetry_noise_batch = extra_batch["epsilon"]
+            # symmetry_noise_batch = obs_batch[self.policy.obs_groups["flow"][0]]
             symmetry_t_batch = extra_batch["t"] 
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 # Augmentation using symmetry
@@ -257,33 +213,17 @@ class FPO:
                 # for extra : 
                 symmetry_t_batch = extra_batch["t"].repeat(num_aug,1)
 
-            # Phase 2 : PPO Update 
-            
-            # 原PPO实现为：
-            # self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
-            # actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            # value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
-            # 这里核心是需要计算replaybuffer中的action在新policy下的log_prob/ELBO, 
+            # AWR : 
+            weights_batch = torch.exp(advantages_batch*self.awr_factor)  # weight of CFM 
+            # print("weights_batch",weights_batch.mean())
             actions_log_prob_batch = self.policy.compute_cfm_loss(obs_batch, actions_batch,
-                                                                  symmetry_noise_batch,
-                                                                  symmetry_t_batch)
+                                                        symmetry_noise_batch,
+                                                        symmetry_t_batch)
+            awr_loss = weights_batch * (-actions_log_prob_batch)
+            awr_loss = awr_loss.mean()
+            # print("cfm_loss",actions_log_prob_batch.mean())
+            
             value_batch = self.policy.evaluate(obs_batch)
-
-            # Surrogate loss
-            # print("cfm:",torch.isnan(actions_log_prob_batch).all())
-            # print("cfm:",(actions_log_prob_batch-torch.squeeze(old_actions_log_prob_batch)).T)
-            log_ratio = actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
-            log_ratio = torch.clamp(log_ratio,-5,5)  # FPO 真正更新非常容易出现梯度爆炸,必须clip保证梯度在合理范围内
-            ratio = torch.exp(log_ratio)
-            # print("ratio",ratio)
-            # print("L_old L_new stats:", old_actions_log_prob_batch.mean(), actions_log_prob_batch.mean(), log_ratio.mean(), log_ratio.abs().max())
-            # print("ratio before clip:", ratio.mean())
-
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
             
             # Value function loss
             if self.use_clipped_value_loss:
@@ -296,7 +236,7 @@ class FPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss
+            loss = awr_loss + self.value_loss_coef * value_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -357,20 +297,15 @@ class FPO:
             # when update the actor / critic, here we finetuning the flow matching policy to get a lipshcitz velocity field
 
             mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
+            mean_awr_loss += awr_loss.item()
             mean_cfm_loss += cfm_loss.item()
-            mean_ratio += ratio.mean().item()
-            # mean_entropy += entropy_batch.mean().item()
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        # mean_entropy /= num_updates
-        mean_cfm_loss /= num_updates
-        mean_ratio /= num_updates
+        mean_awr_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
@@ -379,11 +314,8 @@ class FPO:
         # Construct the loss dictionary
         loss_dict = {
             "value": mean_value_loss,
-            "surrogate": mean_surrogate_loss,
+            "awr": mean_awr_loss,
             "cfm": mean_cfm_loss,
-            "ratio": mean_ratio,
-            # phase 1 : 
-            "delta_action": max_delta_action,
         }
 
         if self.symmetry:

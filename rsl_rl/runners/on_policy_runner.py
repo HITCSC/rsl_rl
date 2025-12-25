@@ -11,7 +11,7 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO,FPO
+from rsl_rl.algorithms import PPO,FPO,RWFM
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -248,7 +248,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO | FPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | FPO | RWFM :
         """Construct the actor-critic algorithm."""
         # Resolve RND config if used
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -283,7 +283,7 @@ class OnPolicyRunner:
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO|FPO = alg_class(
+        alg: PPO|FPO|RWFM = alg_class(
             actor_critic, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
