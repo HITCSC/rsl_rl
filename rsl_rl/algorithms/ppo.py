@@ -40,7 +40,7 @@ class PPO:
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
-        velocity_estimation_enabled: bool = False,
+        velocity_estimation_enabled: bool = True,
         velocity_loss_coef=0.5,
         cnt = 0,
         use_CENet: bool = True,
@@ -389,17 +389,10 @@ class PPO:
                 velocity_network = self.policy.get_velocity_estimation()
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
-                # obs_batch (B,H,D_obs)
                 privileged_obs = obs_batch['privileged']  
-                # policy_obs = obs_batch['policy']
-                # print("obs_batch shape inside PPO update:",obs_batch['privileged'].shape)
-                # [b,h,87] 87 = 3+3+3+26*3
-                # print("privileged_obs", privileged_obs[0,-1])
                 base_lin_vel_last_time = privileged_obs[...,-1,:3] 
-                # print("all_privileged_obs",privileged_obs[0,-1,...])
-                # print("all_policy_obs",policy_obs[0,-1,...])
-                # print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
-                # print("batch 0: estimated_velocity:", velocity_network[0])
+                print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
+                print("batch 0: estimated_velocity:", velocity_network[0])
                 # print("privileged_obs shape:", privileged_obs.shape)
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
                 loss += self.velocity_loss_coef * velocity_loss
@@ -495,17 +488,17 @@ class PPO:
         if self.use_CENet:
             mean_CENet_loss /= num_updates
             loss_dict["CENet_loss"] = mean_CENet_loss
-        # if self.velocity_estimation_enabled:
-        #     mean_velocity_loss /= num_updates
-        #     # TODO 判断何时使用估计速度作为观测速度
-        #     if mean_velocity_loss < 0.5 :
-        #         self.cnt += 1
-        #         if self.cnt > 10:
-        #             # print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
-        #             self.use_estimated_vel = True
-        #     else:
-        #         self.cnt = 0
-        #     loss_dict["velocity_loss"] = mean_velocity_loss
+        if self.velocity_estimation_enabled:
+            mean_velocity_loss /= num_updates
+            # TODO 判断何时使用估计速度作为观测速度
+            if mean_velocity_loss < 0.5 :
+                self.cnt += 1
+                if self.cnt > 10:
+                    # print(f"Velocity constraint satisfied: {self.policy.get_velocity_estimation()}")
+                    self.use_estimated_vel = True
+            else:
+                self.cnt = 0
+            loss_dict["velocity_loss"] = mean_velocity_loss
         return loss_dict
 
     """

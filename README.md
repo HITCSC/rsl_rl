@@ -152,49 +152,6 @@ ppo obs_batch -> AC.act(obs) -> AC.get_actor_obs
 2. AC网络中 actor_obs ->["command"] + ["policy"]拼接 (B,H,4 + num_policy_obs)   critic_obs -> ["command"] + ["privileged"]
 3. low_dim_obs: prop[b,h,d_obs] , high_dim_obs: prep[b,h,L*W*3] 
 
-## 10.20 22-32-32 版训练：
-1.网络结构： encoding传入相同数量history的map_scan与prop，critic不通过encoder，仅有actor走encoder。  
-2.现象： 给速度指令不走，课程上不去   在play的时候给policy_obs传入真实速度，反而导致robo直接倒。
-现在直接不给policy_obs base_lin_vel重训练试试（之前给的 0 0 0） 或者加大vel_reward?   确实可能需要不给policy_obs加入base_lin_vel    不知道是map_scan也叠了history的原因还是速度观测没给对的原因。   目前先测试直接取消policy_obs速度观测  
-Q: 开始时候的loss_velocity下降得太快？ 走都不能走如何能估计速度？ 是否需要设计一种前期不能走的时候不去估计，等到能走的时候再估计，如果这样网络结构如何设计？ 分段训练，冻结参数？
-
-A：目前的课程上不去，尝试分离估计器。使用单帧map_scan与多帧prop，多帧prop不输入actor_MLP  
-分离速度估计器，先用两层linear_layers(input_dim = h*d_obs(h*88)) 估计速度输出，拼接到low_dim_obs :5,6,7位。 estimator——单帧map_scan
-
-目前 enc_vel_actor_critic 很屎，直接在get_obs里面 估计速度再处理拼接，然后输出单帧的obs----目前encoder只接受一帧数据
-
-## 10.23训练
-1. 实际速度不跟踪指令速度而且实际很大是否与传入了错误的policy_obs相关？（前期因为policy_obs传入的速度本身就不准，因为站不住）——如何修改？ 根据episode_length来判断是否使用估计速度？代码实现or分阶段训练？，stage1：前期训练不用速度估计，待epl上去之后才使用速度估计；stage2：Loss_vel下去之后用vel_est代替policy_vel。
-Q:而且目前Loss_velocity的曲线也很奇怪，最大才0.03？ epl为什么能上去？800 但是play的时候站不住？ 跟command给了history有关系吗？
-速度估计有个错误：传出的[B,H,3] 是否这里没用上历史的观测——或者bp的时候没有成功？ 现在改成输出[B,3]尝试  —————— 同样的现象，小command但大实际速度，根本站不住？
-11.24晚：换思路，用两阶段训练，先使用真实速度输入encoder，除去速度的policy_obs输入vel_est。  此时，回复attention_env_cfg中的policy_vel
-训练中途报错：
-```text
-Error executing job with overrides: []
-Traceback (most recent call last):
-  File "/home/hitcsc/isaac_lab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/utils/hydra.py", line 101, in hydra_main
-    func(env_cfg, agent_cfg, *args, **kwargs)
-  File "/home/hitcsc/isaac_lab/Leju-IsaacLab/scripts/rsl_rl/train.py", line 147, in main
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-  File "/home/hitcsc/isaac_lab/rsl_rl/rsl_rl/runners/on_policy_runner.py", line 150, in learn
-    loss_dict = self.alg.update()
-                ^^^^^^^^^^^^^^^^^
-  File "/home/hitcsc/isaac_lab/rsl_rl/rsl_rl/algorithms/ppo.py", line 265, in update
-    self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-  File "/home/hitcsc/isaac_lab/rsl_rl/rsl_rl/modules/enc_vel_actor_critic.py", line 203, in act
-    return self.distribution.sample()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hitcsc/miniconda3/envs/isaac_lab/lib/python3.11/site-packages/torch/distributions/normal.py", line 74, in sample
-    return torch.normal(self.loc.expand(shape), self.scale.expand(shape))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: normal expects all elements of std >= 0.0
-noise_std_type='log' 按理说已经当做参数传入进去了？为什么还是会出现std<0的情况？
-```
-考虑网络结构？ stage1的训练为什么会出现这个错误（使用policy原始91个input，只是加了一个estimator但没有使用其估计数据）
-
-排查是否为网络结构不匹配问题： 去除复杂地形学习速度，resume 一阶段
-1125 速度估计效果还行，开始时有些不准，走动后还行0.05-0.8？ 加个滤波？
-
-1126 用速度估计器代替policy中的速度，估计效果还行，但是注意力还得训练。能在小速度时抵抗不良诱惑，梅花桩走不了，加大梅花桩地形比例，减小速度reward再次训练
-
-12.24 TODO: CENet不跟PPO一起反向传播
+## 12.24
+1. CENet训练Loss降不下去，后续考虑使用一个好的baseline去训练CENet再导出,不再让CENet与PPO一起训练
+2. 在enc_vel_actor_critic中增加estimator的输入正则化，训练看效果。需要还原直接解注释。

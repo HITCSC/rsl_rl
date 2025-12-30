@@ -310,14 +310,7 @@ class EncDreamWAQActorCritic(nn.Module):
         else:
             return obs.view(B, d, horizon).permute(0, 2, 1)  # [B,H,d]
 
-    def get_actor_obs(self, obs:TensorDict,style:str='lab',train_cenet :bool = False)->tuple:
-        """
-        :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
-        :param style : 'lab' or 'gym', for lab style obs the permutation is 
-            [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
-            for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
-        :return : tuple of TensorDict, each element shape is [B,H,d,...]
-        """
+    def get_actor_obs_raw(self, obs:TensorDict)->TensorDict:
         obs_list = []
         for obs_group in self.obs_groups["policy"]:
             obs_list.append(obs[obs_group]) # [B,H,d_i]
@@ -328,8 +321,20 @@ class EncDreamWAQActorCritic(nn.Module):
             high_dim_obs_list.append(obs[obs_group])
         high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
 
+    def get_actor_obs(self, obs:TensorDict,style:str='lab',train_cenet :bool = False)->tuple:
+        """
+        :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
+        :param style : 'lab' or 'gym', for lab style obs the permutation is 
+            [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
+            for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
+        :return : tuple of TensorDict, each element shape is [B,H,d,...]
+        """
+        low_dim_obs, high_dim_obs = self.get_actor_obs_raw(obs, style=style)  # [B,H,d], [B,H,d_high]
+        low_dim_obs_norm = self.actor_obs_normalizer(low_dim_obs)  # [B,H,d]
+
         low_dim_obs_new = low_dim_obs
         # 前4时刻作为CENet_input,当前作为监督信号
+        # 后续方向：加入action预测未来——dream系列（world model）
         if self.use_CENet:
             B, H, d = low_dim_obs.shape
             ce_h = self.CENet.H
@@ -337,9 +342,9 @@ class EncDreamWAQActorCritic(nn.Module):
                 raise RuntimeError(f"History length H={H} 不足以支持CENet: 需要至少 {ce_h+1} 帧")
 
             # 输入：来自policy_obs（去除速度&command）
-            input_CE = low_dim_obs[:, :ce_h, 7:].clone()  # [B,ce_h,84]（确保你的7:后实际是84）
+            input_CE = low_dim_obs_norm[:, :ce_h, 7:].clone()  # [B,ce_h,84]（确保你的7:后实际是84）
 
-            # 监督：来自critic/privileged（真实速度 + 真实下一帧状态子集）
+            # 监督：来自critic（真实速度 + 真实下一帧状态子集）
             if "privileged" not in obs:
                 raise KeyError("use_CENet=True 但 obs 中没有 'privileged'，无法构造CENet监督信号")
             obs_list_c = []
