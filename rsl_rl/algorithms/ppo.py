@@ -31,6 +31,7 @@ class PPO:
         gamma=0.99,
         lam=0.95,
         value_loss_coef=1.0,
+        velocity_loss_coef=1.0,
         entropy_coef=0.01,
         learning_rate=0.001,
         max_grad_norm=1.0,
@@ -41,9 +42,8 @@ class PPO:
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
         velocity_estimation_enabled: bool = True,
-        velocity_loss_coef=1,
         critic_estimator_slice = [87,88,89,90,91,92,93,94],
-        critic_estimator_enable: bool = True,
+        critic_estimator_enable: bool = False,
         critic_loss_coef: float = 0.3,
         # Critic estimator loss shaping
         critic_force_loss_weight: float = 1.0,
@@ -123,13 +123,18 @@ class PPO:
                 if name.startswith("CENet."):
                     continue
                 ppo_params.append(p)
-            self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
+            # NOTE: disable foreach to avoid foreach shape-mismatch crashes when some optimizer state tensors
+            # are stale (e.g. after changing model shapes / loading partially compatible checkpoints).
+            self.optimizer = optim.Adam(ppo_params, lr=learning_rate, foreach=False)
 
             # 新增：CENet独立优化器
-            self.cenet_optimizer = optim.Adam(self.policy.CENet.parameters(), lr=learning_rate * 0.5)
+            self.cenet_optimizer = optim.Adam(self.policy.CENet.parameters(), lr=learning_rate * 0.5, foreach=False)
         else:
-            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate, foreach=False)
             self.cenet_optimizer = None
+
+        # Lazily validate/repair optimizer state before first step.
+        self._optimizer_state_checked = False
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -151,6 +156,7 @@ class PPO:
         self.velocity_estimation_enabled = velocity_estimation_enabled
         print("PPO velocity_estimation_enabled:", self.velocity_estimation_enabled)
         self.velocity_loss_coef = velocity_loss_coef
+        self.critic_estimator_enable = critic_estimator_enable
         self.critic_loss_coef = critic_loss_coef
         self.critic_estimator_slice = critic_estimator_slice
         self.critic_force_loss_weight = critic_force_loss_weight
@@ -234,6 +240,7 @@ class PPO:
 
         if self.velocity_estimation_enabled:
             mean_velocity_loss = 0
+        elif self.critic_estimator_enable:
             mean_critic_loss = 0
             mean_critic_force_loss = 0
             mean_critic_height_loss = 0
@@ -403,34 +410,43 @@ class PPO:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
+                
 
             # velocity estimation loss
             if self.velocity_estimation_enabled:
                 # compute the velocity
                 velocity_network = self.policy.get_velocity_estimation()
-                cirtic_estimated = self.policy.get_critic_estimation()
+                if velocity_network is None:
+                    raise RuntimeError(
+                        "velocity_estimation_enabled is True but policy.get_velocity_estimation() returned None. "
+                        "Make sure the policy sets last_estimated_velocity during act()/act_inference()."
+                    )
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
                 privileged_obs = obs_batch['privileged']  
-                base_lin_vel_last_time = privileged_obs[...,-1,:3] 
+                base_lin_vel_last_time = privileged_obs[:, -1, :3]
+                if velocity_network.shape != base_lin_vel_last_time.shape:
+                    raise RuntimeError(
+                        f"Velocity pred/target shape mismatch: pred={tuple(velocity_network.shape)}, "
+                        f"target={tuple(base_lin_vel_last_time.shape)}"
+                    )
                 # print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
                 # print("batch 0: estimated_velocity:", velocity_network[0])
-                # 此处privilege还没拼接command，所以slice相对于AC中的需要减4
-                critic_obs = privileged_obs[...,-1,self.critic_estimator_slice]
                 # print("privileged_obs shape:", privileged_obs.shape)
-                # Debug prints are expensive; enable only when needed.
-                # if self.gpu_global_rank == 0:
-                #     print("critic obs:", critic_obs[-1,...])
-                #     print("critic estimated:", cirtic_estimated[0])
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
-
+                loss += self.velocity_loss_coef * velocity_loss
+                mean_velocity_loss += velocity_loss.item()  
+            if self.critic_estimator_enable:
+                print("Using critic estimator loss")
+                self.critic_estimated = self.policy.get_critic_estimation()
+                critic_obs = privileged_obs[...,-1,self.critic_estimator_slice] # 此处privilege还没拼接command，所以slice相对于AC中的需要减4
                 # Critic estimator loss (two-head): first 6 dims are forces, last 2 dims are feet heights.
                 # This avoids large-magnitude force terms dominating the small-magnitude height terms.
-                if cirtic_estimated is None:
+                if self.critic_estimated is None:
                     raise RuntimeError("critic_estimator_enable is True but policy.get_critic_estimation() returned None")
-                if cirtic_estimated.shape != critic_obs.shape:
+                if self.critic_estimated.shape != critic_obs.shape:
                     raise RuntimeError(
-                        f"critic_estimated shape {tuple(cirtic_estimated.shape)} != critic_obs shape {tuple(critic_obs.shape)}"
+                        f"critic_estimated shape {tuple(self.critic_estimated.shape)} != critic_obs shape {tuple(critic_obs.shape)}"
                     )
                 if critic_obs.shape[-1] != 8:
                     raise RuntimeError(f"Expected critic_obs last dim = 8 (force6+height2), got {critic_obs.shape[-1]}")
@@ -438,8 +454,8 @@ class PPO:
                 # split
                 force_tgt = critic_obs.detach()[..., :6]
                 height_tgt = critic_obs.detach()[..., 6:]
-                force_pred = cirtic_estimated[..., :6]
-                height_pred = cirtic_estimated[..., 6:]
+                force_pred = self.critic_estimated[..., :6]
+                height_pred = self.critic_estimated[..., 6:]
 
                 # Compute force loss in scaled space to reduce magnitude dominance.
                 # Note: we keep gradients (do NOT detach preds).
@@ -455,9 +471,7 @@ class PPO:
                     self.critic_force_loss_weight * critic_force_loss
                     + self.critic_height_loss_weight * critic_height_loss
                 )
-                loss += self.velocity_loss_coef * velocity_loss
                 loss += self.critic_loss_coef * critic_loss
-                mean_velocity_loss += velocity_loss.item()
                 mean_critic_loss += critic_loss.item()
                 mean_critic_force_loss += critic_force_loss.item()
                 mean_critic_height_loss += critic_height_loss.item()
@@ -503,6 +517,25 @@ class PPO:
             # Apply the gradients
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+            # One-time check: clear stale Adam state tensors whose shapes don't match current params.
+            # This avoids runtime errors during optimizer.step(), especially in foreach implementations.
+            if not self._optimizer_state_checked:
+                self._optimizer_state_checked = True
+                for group in self.optimizer.param_groups:
+                    for p in group["params"]:
+                        if p is None:
+                            continue
+                        st = self.optimizer.state.get(p)
+                        if not st:
+                            continue
+                        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                            t = st.get(key)
+                            if t is None:
+                                continue
+                            if t.shape != p.shape:
+                                st.clear()
+                                break
             self.optimizer.step()
 
             # -- For RND
@@ -554,9 +587,6 @@ class PPO:
             loss_dict["CENet_loss"] = mean_CENet_loss
         if self.velocity_estimation_enabled:
             mean_velocity_loss /= num_updates
-            mean_critic_loss /= num_updates
-            mean_critic_force_loss /= num_updates
-            mean_critic_height_loss /= num_updates
             # TODO 判断何时使用估计速度作为观测速度
             if mean_velocity_loss < 0.5 :
                 self.cnt += 1
@@ -566,6 +596,10 @@ class PPO:
             else:
                 self.cnt = 0
             loss_dict["velocity_loss"] = mean_velocity_loss
+        if self.critic_estimator_enable:
+            mean_critic_loss /= num_updates
+            mean_critic_force_loss /= num_updates
+            mean_critic_height_loss /= num_updates
             loss_dict["critic_loss"] = mean_critic_loss
             loss_dict["critic_force_loss"] = mean_critic_force_loss
             loss_dict["critic_height_loss"] = mean_critic_height_loss

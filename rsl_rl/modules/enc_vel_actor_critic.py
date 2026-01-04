@@ -91,7 +91,7 @@ class EncVelActorCritic(nn.Module):
             self.critic_estimator_slice = critic_estimator_slice
             self.critic_estimator = Critic_Estimator(history_len=5, d_obs=84,output_dim=len(self.critic_estimator_slice))
             print("Critic Velocity Estimator:", self.critic_estimator)
-        if critic_estimator_enable:
+        if self.critic_estimator_enable:
             self.encoder = AttentionMapEncoder(self.num_actor_obs + len(self.critic_estimator_slice),embedding_dim=embedding_dim)
         else:
             self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
@@ -115,8 +115,10 @@ class EncVelActorCritic(nn.Module):
         self.output_attention = output_attention  # 是否输出attention 
         
         if self.dis_vel_estimator:
-            embedding_actor_dim = self.embedding_dim + self.num_actor_obs + len(self.critic_estimator_slice)
+            embedding_actor_dim = self.embedding_dim + self.num_actor_obs 
             embedding_critic_dim = self.embedding_dim + num_critic_obs
+        elif self.critic_estimator_enable:
+            embedding_actor_dim = self.embedding_dim + self.num_actor_obs + len(self.critic_estimator_slice)
         else:
             embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
             embedding_critic_dim = self.horizon*(self.embedding_dim + num_critic_obs) # [H*(d_obs + d)]
