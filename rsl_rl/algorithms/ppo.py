@@ -41,7 +41,17 @@ class PPO:
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
         velocity_estimation_enabled: bool = True,
-        velocity_loss_coef=0.5,
+        velocity_loss_coef=1,
+        critic_estimator_slice = [87,88,89,90,91,92,93,94],
+        critic_estimator_enable: bool = True,
+        critic_loss_coef: float = 0.3,
+        # Critic estimator loss shaping
+        critic_force_loss_weight: float = 1.0,
+        critic_height_loss_weight: float = 1.0,
+        # Scale for force targets/preds (in Newtons). Loss is computed in scaled space:
+        #   MSE(force/scale, tgt/scale)
+        # This prevents large-magnitude forces (hundreds/thousands) from dominating.
+        critic_force_scale: float = 1000.0,
         cnt = 0,
         use_CENet: bool = True,
         # RND parameters
@@ -141,6 +151,11 @@ class PPO:
         self.velocity_estimation_enabled = velocity_estimation_enabled
         print("PPO velocity_estimation_enabled:", self.velocity_estimation_enabled)
         self.velocity_loss_coef = velocity_loss_coef
+        self.critic_loss_coef = critic_loss_coef
+        self.critic_estimator_slice = critic_estimator_slice
+        self.critic_force_loss_weight = critic_force_loss_weight
+        self.critic_height_loss_weight = critic_height_loss_weight
+        self.critic_force_scale = critic_force_scale
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
@@ -219,8 +234,14 @@ class PPO:
 
         if self.velocity_estimation_enabled:
             mean_velocity_loss = 0
+            mean_critic_loss = 0
+            mean_critic_force_loss = 0
+            mean_critic_height_loss = 0
         else:
             mean_velocity_loss = None
+            mean_critic_loss = None
+            mean_critic_force_loss = None
+            mean_critic_height_loss = None
         if self.use_CENet:
             mean_CENet_loss = 0
         # generator for mini batches
@@ -387,17 +408,60 @@ class PPO:
             if self.velocity_estimation_enabled:
                 # compute the velocity
                 velocity_network = self.policy.get_velocity_estimation()
+                cirtic_estimated = self.policy.get_critic_estimation()
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
                 privileged_obs = obs_batch['privileged']  
                 base_lin_vel_last_time = privileged_obs[...,-1,:3] 
-                print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
-                print("batch 0: estimated_velocity:", velocity_network[0])
+                # print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
+                # print("batch 0: estimated_velocity:", velocity_network[0])
+                # 此处privilege还没拼接command，所以slice相对于AC中的需要减4
+                critic_obs = privileged_obs[...,-1,self.critic_estimator_slice]
                 # print("privileged_obs shape:", privileged_obs.shape)
+                # Debug prints are expensive; enable only when needed.
+                # if self.gpu_global_rank == 0:
+                #     print("critic obs:", critic_obs[-1,...])
+                #     print("critic estimated:", cirtic_estimated[0])
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
-                loss += self.velocity_loss_coef * velocity_loss
-                mean_velocity_loss += velocity_loss.item()
 
+                # Critic estimator loss (two-head): first 6 dims are forces, last 2 dims are feet heights.
+                # This avoids large-magnitude force terms dominating the small-magnitude height terms.
+                if cirtic_estimated is None:
+                    raise RuntimeError("critic_estimator_enable is True but policy.get_critic_estimation() returned None")
+                if cirtic_estimated.shape != critic_obs.shape:
+                    raise RuntimeError(
+                        f"critic_estimated shape {tuple(cirtic_estimated.shape)} != critic_obs shape {tuple(critic_obs.shape)}"
+                    )
+                if critic_obs.shape[-1] != 8:
+                    raise RuntimeError(f"Expected critic_obs last dim = 8 (force6+height2), got {critic_obs.shape[-1]}")
+
+                # split
+                force_tgt = critic_obs.detach()[..., :6]
+                height_tgt = critic_obs.detach()[..., 6:]
+                force_pred = cirtic_estimated[..., :6]
+                height_pred = cirtic_estimated[..., 6:]
+
+                # Compute force loss in scaled space to reduce magnitude dominance.
+                # Note: we keep gradients (do NOT detach preds).
+                if self.critic_force_scale <= 0:
+                    raise ValueError(f"critic_force_scale must be > 0, got {self.critic_force_scale}")
+                force_pred_s = force_pred / self.critic_force_scale
+                force_tgt_s = force_tgt / self.critic_force_scale
+
+                critic_force_loss = vel_mse_loss(force_pred_s, force_tgt_s)
+                critic_height_loss = vel_mse_loss(height_pred, height_tgt)
+
+                critic_loss = (
+                    self.critic_force_loss_weight * critic_force_loss
+                    + self.critic_height_loss_weight * critic_height_loss
+                )
+                loss += self.velocity_loss_coef * velocity_loss
+                loss += self.critic_loss_coef * critic_loss
+                mean_velocity_loss += velocity_loss.item()
+                mean_critic_loss += critic_loss.item()
+                mean_critic_force_loss += critic_force_loss.item()
+                mean_critic_height_loss += critic_height_loss.item()
+            
             # CENet loss：单独优化（不加入PPO总loss）
             if self.use_CENet:
                 CENet_loss = self.policy.compute_CENet_loss(obs_batch)
@@ -490,6 +554,9 @@ class PPO:
             loss_dict["CENet_loss"] = mean_CENet_loss
         if self.velocity_estimation_enabled:
             mean_velocity_loss /= num_updates
+            mean_critic_loss /= num_updates
+            mean_critic_force_loss /= num_updates
+            mean_critic_height_loss /= num_updates
             # TODO 判断何时使用估计速度作为观测速度
             if mean_velocity_loss < 0.5 :
                 self.cnt += 1
@@ -499,6 +566,9 @@ class PPO:
             else:
                 self.cnt = 0
             loss_dict["velocity_loss"] = mean_velocity_loss
+            loss_dict["critic_loss"] = mean_critic_loss
+            loss_dict["critic_force_loss"] = mean_critic_force_loss
+            loss_dict["critic_height_loss"] = mean_critic_height_loss
         return loss_dict
 
     """

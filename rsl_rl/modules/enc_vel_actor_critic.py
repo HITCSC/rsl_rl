@@ -5,8 +5,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 from tensordict import TensorDict 
 from rsl_rl.networks import MLP, EmpiricalNormalization, AttentionMapEncoder 
-from rsl_rl.networks.estimator import Velocity_Estimator
-from rsl_rl.networks.estimator import Velocity_Estimator
+from rsl_rl.networks.estimator import Velocity_Estimator,Critic_Estimator
 from rsl_rl.networks.CENet import CENet
 # 为了actor and critic复用encoder —— 解耦速度估计器  将速度估计3dim输入到 act中\
 # 有很多shit代码：由于先update_actor_obs_norm再拼接速度，可能存在问题
@@ -19,6 +18,7 @@ class EncVelActorCritic(nn.Module):
     LOAD_NORMALIZER_WEIGHTS = 8
     LOAD_VELOCITY_WEIGHTS = 16
     LOAD_CENET_WEIGHTS = 32
+    LOAD_CRITIC_WEIGHTS = 64
 
     def __init__(
         self,
@@ -35,9 +35,11 @@ class EncVelActorCritic(nn.Module):
         noise_std_type: str = "log",
         embedding_dim=64,
         dis_vel_estimator: bool = True,
-        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS|LOAD_VELOCITY_WEIGHTS|LOAD_CENET_WEIGHTS,
+        load_mask:int=LOAD_POLICY_WEIGHTS|LOAD_CRITIC_WEIGHTS|LOAD_ENCODER_WEIGHTS|LOAD_NORMALIZER_WEIGHTS|LOAD_VELOCITY_WEIGHTS|LOAD_CENET_WEIGHTS|LOAD_CRITIC_WEIGHTS,
         output_attention:bool=False,
         critic_encoder:bool=False,
+        critic_estimator_enable: bool = True,
+        critic_estimator_slice: int = [91,92,93,94,95,96,97,98],
         **kwargs,
     ):
         if kwargs:
@@ -83,14 +85,22 @@ class EncVelActorCritic(nn.Module):
         if self.dis_vel_estimator:
             self.last_estimated_velocity: torch.Tensor = None
             self.history_estimated_velocity: torch.Tensor = None
-
-        self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
+        self.velocity_estimator = Velocity_Estimator(history_len=5, d_obs=84,output_dim=3)
+        self.critic_estimator_enable = critic_estimator_enable
+        if self.critic_estimator_enable:
+            self.critic_estimator_slice = critic_estimator_slice
+            self.critic_estimator = Critic_Estimator(history_len=5, d_obs=84,output_dim=len(self.critic_estimator_slice))
+            print("Critic Velocity Estimator:", self.critic_estimator)
+        if critic_estimator_enable:
+            self.encoder = AttentionMapEncoder(self.num_actor_obs + len(self.critic_estimator_slice),embedding_dim=embedding_dim)
+        else:
+            self.encoder = AttentionMapEncoder(self.num_actor_obs,embedding_dim=embedding_dim)
         print(f"Encoder : {self.encoder}")
         
         # 这里obs为[env]
         self.horizon = scan_height_shape[1]  # TODO 有坑，默认使用map_scan的history作为整个系统的历史观测长度，后续考虑分离——num_actor_obs等等 ——MLP的输入维度
 
-        self.velocity_estimator = Velocity_Estimator(history_len=5, d_obs=84,output_dim=3)
+        
         self.use_CENet = use_CENet
         self.lantent_dim = 48
         if self.use_CENet:
@@ -105,7 +115,7 @@ class EncVelActorCritic(nn.Module):
         self.output_attention = output_attention  # 是否输出attention 
         
         if self.dis_vel_estimator:
-            embedding_actor_dim = self.embedding_dim + self.num_actor_obs
+            embedding_actor_dim = self.embedding_dim + self.num_actor_obs + len(self.critic_estimator_slice)
             embedding_critic_dim = self.embedding_dim + num_critic_obs
         else:
             embedding_actor_dim = self.horizon*(self.embedding_dim + num_actor_obs ) # [H*(d_obs+d)]
@@ -140,7 +150,10 @@ class EncVelActorCritic(nn.Module):
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,self.num_actor_obs))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
+            if self.critic_estimator_enable and self.dis_vel_estimator:
+                self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,self.num_actor_obs + len(self.critic_estimator_slice)))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
+            else:
+                self.actor_obs_normalizer = EmpiricalNormalization((self.horizon,self.num_actor_obs))  # 这里是支持输入[B,H,d]的(self.horizon,num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
@@ -248,7 +261,6 @@ class EncVelActorCritic(nn.Module):
             embedding, _ = self.encoder(high_dim_obs, low_dim_query, embedding_only=True)
             critic_obs = torch.cat([embedding, low_dim_obs], dim=-1)  # [B,H,emb+d]
             critic_obs = critic_obs.view(critic_obs.shape[0], -1)     # [B,H*(emb+d)]
-
         values = self.critic(critic_obs)
         return values
     
@@ -300,96 +312,25 @@ class EncVelActorCritic(nn.Module):
             return obs.view(B, d, horizon).permute(0, 2, 1)  # [B,H,d]
 
 
-    def get_actor_obs_raw(self, obs: TensorDict, style: str = 'lab') -> tuple[torch.Tensor, torch.Tensor]:
-        """Construct actor observations without any velocity estimation/replacement.
+    # def get_actor_obs_raw(self, obs: TensorDict, style: str = 'lab') -> tuple[torch.Tensor, torch.Tensor]:
+    #     """Construct actor observations without any velocity estimation/replacement.
 
-        Returns:
-            low_dim_obs: [B,H,d]
-            high_dim_obs: [B,H,d_high]
-        """
-        obs_list = []
-        for obs_group in self.obs_groups["policy"]:
-            obs_list.append(obs[obs_group])  # [B,H,d_i]
-        low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
+    #     Returns:
+    #         low_dim_obs: [B,H,d]
+    #         high_dim_obs: [B,H,d_high]
+    #     """
+    #     obs_list = []
+    #     for obs_group in self.obs_groups["policy"]:
+    #         obs_list.append(obs[obs_group])  # [B,H,d_i]
+    #     low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
 
-        high_dim_obs_list = []
-        for obs_group in self.obs_groups["perception"]:
-            high_dim_obs_list.append(obs[obs_group])
-        high_dim_obs = torch.cat(high_dim_obs_list, dim=-1)
-        return low_dim_obs, high_dim_obs
-
-
-
-    def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
-        """
-        :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
-        :param style : 'lab' or 'gym', for lab style obs the permutation is 
-            [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
-            for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
-        :return : tuple of TensorDict, each element shape is [B,H,d,...]
-        """
-        # 1) raw observations (no replacement)
-        low_dim_obs, high_dim_obs = self.get_actor_obs_raw(obs, style=style)  # [B,H,d], [B,H,d_high]
-
-        # 2) normalized observations for estimators (only used as estimator inputs)
-        #    Note: actor still normalizes its final input again in act()/act_inference() to keep existing behavior.
-        low_dim_obs_norm = self.actor_obs_normalizer(low_dim_obs)
-
-        low_dim_obs_new = None
-        # 前4时刻作为CENet_input,当前作为监督信号
-        if self.use_CENet:
-            B = low_dim_obs.shape[0]
-            H = low_dim_obs.shape[1]
-            #输入前4个history
-            # 使用归一化后的 props 作为估计输入（去除速度及command）
-            input_CE = low_dim_obs_norm[:,:H-1,7:].clone()  # [B,H-1,d-7]
-            v_true = low_dim_obs[:,-1,4:7].clone()  # [B,3]
-            # 监督信号错误：需要用特权观测
-            o_next_true = low_dim_obs[:,-1,7:].clone()  # [B,d]
-            CENet_outputs = self.CENet(input_CE,v_true=v_true, o_next_true=o_next_true) 
-            self.v_est = CENet_outputs["v_est"].unsqueeze(dim=1)  # [B,1,3]
-            self.z = CENet_outputs["z"]
-            self.CENet_loss = CENet_outputs["total_loss"]
-            low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
-            low_dim_obs_new[:, :, 4:7] = self.v_est
-            high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
-            # latent是直接输入MHA还是输入actor？ dreamwaq是作为原始观测代替输入的——1.直接代替prop与map_encoding拼接； 2.直接把latent输入mha
-        if self.dis_vel_estimator:
-            B = low_dim_obs.shape[0]
-            H = low_dim_obs.shape[1]
-            # stage1 训练estimator，low_obs_dim中使用实际速度传入encoder,但要考虑传入estimator的不要包含速度
-            #去掉low_dim_obs的速度部分,在tensor中为第4，5，6位
-            # 12.2 TODO 去掉low_dim_obs的前7维度
-            # 使用归一化后的 props 作为速度估计输入
-            input_estimator = low_dim_obs_norm[:,:,7:]
-            # input_estimator = torch.cat([low_dim_obs[:,:,:4],low_dim_obs[:,:,7:]],dim=-1)  # [B,H,d-3]
-            vel_esitimated = self.velocity_estimator(input_estimator)  # [B,3]
-            self.last_estimated_velocity = vel_esitimated
-            vel_esitimated_reshape = vel_esitimated.unsqueeze(dim=1)  # [B,1,3]
-            # 注意：如果同时开启CENet与dis_vel_estimator，这里会覆盖前面的替换（保持你原先行为）
-            low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
-            # 修正索引：用[:, :, 4:7]（形状[B,1,3]）匹配vel_esitimated_reshape的[B,1,3]
+    #     high_dim_obs_list = []
+    #     for obs_group in self.obs_groups["perception"]:
+    #         high_dim_obs_list.append(obs[obs_group])
+    #     high_dim_obs = torch.cat(high_dim_obs_list, dim=-1)
+    #     return low_dim_obs, high_dim_obs
 
 
-            # stage2: 使用替换后的速度估计
-            # if(self.stage == 2):
-            low_dim_obs_new[:, :, 4:7] = vel_esitimated_reshape
-
-
-            # print("low_dim_obs_modify",low_dim_obs_new[0,0,4:7])
-            # low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
-            # low_dim_obs = low_dim_obs_new.unsqueeze(dim=1)
-            # print("low_dim_obs shape",low_dim_obs.shape)
-            # stage1 训练estimator，但使用实际速度 直接返回low_dim_obs_new
-            high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
-        # 如果两个开关都关了，保持最小兼容：直接返回最后一帧
-        if low_dim_obs_new is None:
-            low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)
-            high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
-        return low_dim_obs_new,high_dim_obs
-
-        
-    
 
     # def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
     #     """
@@ -399,29 +340,21 @@ class EncVelActorCritic(nn.Module):
     #         for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
     #     :return : tuple of TensorDict, each element shape is [B,H,d,...]
     #     """
-    #     obs_list = []
-    #     for obs_group in self.obs_groups["policy"]:
-    #         # command & policy
-    #         # 这里假设每个group的历史堆叠形式是gym style的
-    #         # if style == 'lab':
-    #         #     gym_obs = self._lab_to_gym(obs[obs_group], self.horizon,keep_dim=False)  # [B,H,d]
-    #         #     obs_list.append(gym_obs)
-    #         # else:
-    #         #     B = obs[obs_group].shape[0]
-    #         #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
-    #         obs_list.append(obs[obs_group]) # [B,H,d_i]
-    #     low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
-        
-    #     high_dim_obs_list = []
-    #     for obs_group in self.obs_groups["perception"]:
-    #         high_dim_obs_list.append(obs[obs_group])
-    #     high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
+    #     # 1) raw observations (no replacement)
+    #     low_dim_obs, high_dim_obs = self.get_actor_obs_raw(obs, style=style)  # [B,H,d], [B,H,d_high]
+
+    #     # 2) normalized observations for estimators (only used as estimator inputs)
+    #     #    Note: actor still normalizes its final input again in act()/act_inference() to keep existing behavior.
+    #     low_dim_obs_norm = self.actor_obs_normalizer(low_dim_obs)
+
+    #     low_dim_obs_new = None
     #     # 前4时刻作为CENet_input,当前作为监督信号
     #     if self.use_CENet:
     #         B = low_dim_obs.shape[0]
     #         H = low_dim_obs.shape[1]
     #         #输入前4个history
-    #         input_CE = low_dim_obs[:,:H-1,7:].clone()  # [B,H-1,d-7] 去除速度及command
+    #         # 使用归一化后的 props 作为估计输入（去除速度及command）
+    #         input_CE = low_dim_obs_norm[:,:H-1,7:].clone()  # [B,H-1,d-7]
     #         v_true = low_dim_obs[:,-1,4:7].clone()  # [B,3]
     #         # 监督信号错误：需要用特权观测
     #         o_next_true = low_dim_obs[:,-1,7:].clone()  # [B,d]
@@ -439,11 +372,13 @@ class EncVelActorCritic(nn.Module):
     #         # stage1 训练estimator，low_obs_dim中使用实际速度传入encoder,但要考虑传入estimator的不要包含速度
     #         #去掉low_dim_obs的速度部分,在tensor中为第4，5，6位
     #         # 12.2 TODO 去掉low_dim_obs的前7维度
-    #         input_estimator = low_dim_obs[:,:,7:]
+    #         # 使用归一化后的 props 作为速度估计输入
+    #         input_estimator = low_dim_obs_norm[:,:,7:]
     #         # input_estimator = torch.cat([low_dim_obs[:,:,:4],low_dim_obs[:,:,7:]],dim=-1)  # [B,H,d-3]
     #         vel_esitimated = self.velocity_estimator(input_estimator)  # [B,3]
     #         self.last_estimated_velocity = vel_esitimated
     #         vel_esitimated_reshape = vel_esitimated.unsqueeze(dim=1)  # [B,1,3]
+    #         # 注意：如果同时开启CENet与dis_vel_estimator，这里会覆盖前面的替换（保持你原先行为）
     #         low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
     #         # 修正索引：用[:, :, 4:7]（形状[B,1,3]）匹配vel_esitimated_reshape的[B,1,3]
 
@@ -459,7 +394,94 @@ class EncVelActorCritic(nn.Module):
     #         # print("low_dim_obs shape",low_dim_obs.shape)
     #         # stage1 训练estimator，但使用实际速度 直接返回low_dim_obs_new
     #         high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
+    #     # 如果两个开关都关了，保持最小兼容：直接返回最后一帧
+    #     if low_dim_obs_new is None:
+    #         low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)
+    #         high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
     #     return low_dim_obs_new,high_dim_obs
+
+        
+    
+
+    def get_actor_obs(self, obs:TensorDict,style:str='lab')->tuple:
+        """
+        :param obs: TensorDict, each element shape maybe [B,H*d] or [B,H,d,...]
+        :param style : 'lab' or 'gym', for lab style obs the permutation is 
+            [O_{1:H}^1,O_{1:H}^2,...,O_{1:H}^n] where n is the index of part/group;
+            for gym style obs , the permutation is [O_1^1,...,O_1^n,O_2^1,...,O_2^n,...,O_H^n]
+        :return : tuple of TensorDict, each element shape is [B,H,d,...]
+        """
+        obs_list = []
+        for obs_group in self.obs_groups["policy"]:
+            # command & policy
+            # 这里假设每个group的历史堆叠形式是gym style的
+            # if style == 'lab':
+            #     gym_obs = self._lab_to_gym(obs[obs_group], self.horizon,keep_dim=False)  # [B,H,d]
+            #     obs_list.append(gym_obs)
+            # else:
+            #     B = obs[obs_group].shape[0]
+            #     obs_list.append(obs[obs_group].reshape(B,self.horizon,-1))  # [B,H,d_i]
+            obs_list.append(obs[obs_group]) # [B,H,d_i]
+        low_dim_obs = torch.cat(obs_list, dim=-1)  # [B,H,d]
+        
+        high_dim_obs_list = []
+        for obs_group in self.obs_groups["perception"]:
+            high_dim_obs_list.append(obs[obs_group])
+        high_dim_obs = torch.cat(high_dim_obs_list, dim=-1) 
+        # Initialize output as last frame; other branches may overwrite slices.
+        low_dim_obs_new = low_dim_obs[:,-1,:].unsqueeze(dim=1)  # [B,1,d]
+        high_dim_obs = high_dim_obs[:,-1,:].unsqueeze(dim=1)
+
+        # 前4时刻作为CENet_input,当前作为监督信号
+        if self.use_CENet:
+            B = low_dim_obs.shape[0]
+            H = low_dim_obs.shape[1]
+            #输入前4个history
+            input_CE = low_dim_obs[:,:H-1,7:].clone()  # [B,H-1,d-7] 去除速度及command
+            v_true = low_dim_obs[:,-1,4:7].clone()  # [B,3]
+            # 监督信号错误：需要用特权观测
+            o_next_true = low_dim_obs[:,-1,7:].clone()  # [B,d]
+            CENet_outputs = self.CENet(input_CE,v_true=v_true, o_next_true=o_next_true) 
+            self.v_est = CENet_outputs["v_est"].unsqueeze(dim=1)  # [B,1,3]
+            self.z = CENet_outputs["z"]
+            self.CENet_loss = CENet_outputs["total_loss"]
+            low_dim_obs_new[:, :, 4:7] = self.v_est
+            # latent是直接输入MHA还是输入actor？ dreamwaq是作为原始观测代替输入的——1.直接代替prop与map_encoding拼接； 2.直接把latent输入mha
+        if self.dis_vel_estimator:
+            B = low_dim_obs.shape[0]
+            H = low_dim_obs.shape[1]
+            # stage1 训练estimator，low_obs_dim中使用实际速度传入encoder,但要考虑传入estimator的不要包含速度
+            #去掉low_dim_obs的速度部分,在tensor中为第4，5，6位
+            # 12.2 TODO 去掉low_dim_obs的前7维度
+            input_estimator = low_dim_obs[:,:,7:]
+            # input_estimator = torch.cat([low_dim_obs[:,:,:4],low_dim_obs[:,:,7:]],dim=-1)  # [B,H,d-3]
+            vel_esitimated = self.velocity_estimator(input_estimator)  # [B,3]
+            self.last_estimated_velocity = vel_esitimated
+            vel_esitimated_reshape = vel_esitimated.unsqueeze(dim=1)  # [B,1,3]
+            # 修正索引：用[:, :, 4:7]（形状[B,1,3]）匹配vel_esitimated_reshape的[B,1,3]
+
+
+            # stage2: 使用替换后的速度估计
+            # if(self.stage == 2):
+            low_dim_obs_new[:, :, 4:7] = vel_esitimated_reshape
+
+
+            # print("low_dim_obs_modify",low_dim_obs_new[0,0,4:7])
+            # low_dim_obs = torch.cat([low_dim_obs_new,vel_esitimated_reshape],dim =-1)
+            # low_dim_obs = low_dim_obs_new.unsqueeze(dim=1)
+            # print("low_dim_obs shape",low_dim_obs.shape)
+            # stage1 训练estimator，但使用实际速度 直接返回low_dim_obs_new
+        if self.critic_estimator_enable:
+            B = low_dim_obs.shape[0]
+            H = low_dim_obs.shape[1]
+            input_critic_estimator = low_dim_obs[:,:,7:]  # [B,H,4]
+            critic_estimated = self.critic_estimator(input_critic_estimator)  # [B,4]
+            critic_estimated_reshape = critic_estimated.unsqueeze(dim=1)  # [B,1,4]
+
+            # Append critic estimates without overwriting previously replaced velocity.
+            low_dim_obs_new = torch.cat([low_dim_obs_new,critic_estimated_reshape],dim=-1)  # [B,1,d+K]
+            self.critic_estimated = critic_estimated
+        return low_dim_obs_new,high_dim_obs
 
 
     def get_critic_obs(self, obs:TensorDict,style:str='lab')->tuple:
@@ -490,28 +512,27 @@ class EncVelActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
     
 
-    def update_normalization(self, obs):
-        if self.actor_obs_normalization:
-            # 用 raw actor obs 更新统计，避免估计速度污染 normalizer 的mean/var
-            actor_obs_raw, _ = self.get_actor_obs_raw(obs)
-            actor_obs_raw = actor_obs_raw[:,-1,:].unsqueeze(dim=1)
-            self.actor_obs_normalizer.update(actor_obs_raw)
-        if self.critic_obs_normalization:
-            critic_obs,_ = self.get_critic_obs(obs)
-            self.critic_obs_normalizer.update(critic_obs)
-
-
-
     # def update_normalization(self, obs):
     #     if self.actor_obs_normalization:
-    #         actor_obs,_ = self.get_actor_obs(obs)
-    #         #传入的 actor_obs [b,3,88]
-    #         actor_obs = actor_obs[:,-1,:]
-    #         actor_obs = actor_obs.unsqueeze(dim=1)
-    #         self.actor_obs_normalizer.update(actor_obs)
+    #         # 用 raw actor obs 更新统计，避免估计速度污染 normalizer 的mean/var
+    #         actor_obs_raw, _ = self.get_actor_obs_raw(obs)
+    #         actor_obs_raw = actor_obs_raw[:,-1,:].unsqueeze(dim=1)
+    #         self.actor_obs_normalizer.update(actor_obs_raw)
     #     if self.critic_obs_normalization:
     #         critic_obs,_ = self.get_critic_obs(obs)
     #         self.critic_obs_normalizer.update(critic_obs)
+
+
+    def update_normalization(self, obs):
+        if self.actor_obs_normalization:
+            actor_obs,_ = self.get_actor_obs(obs)
+            #传入的 actor_obs [b,3,88]
+            actor_obs = actor_obs[:,-1,:]
+            actor_obs = actor_obs.unsqueeze(dim=1)
+            self.actor_obs_normalizer.update(actor_obs)
+        if self.critic_obs_normalization:
+            critic_obs,_ = self.get_critic_obs(obs)
+            self.critic_obs_normalizer.update(critic_obs)
 
     # for state_dict :
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
@@ -577,6 +598,10 @@ class EncVelActorCritic(nn.Module):
             else:
                 print("=== EncVelActorCritic : No CENet weights found in checkpoint ===")
         # super().load_state_dict(state_dict, strict=strict)
+        if self.critic_estimator_enable:
+            critic_estimator_state_dict = {k.replace('critic_estimator.', '',1): v for k, v in state_dict.items() if k.startswith('critic_estimator.')}
+            self.critic_estimator.load_state_dict(critic_estimator_state_dict, strict=strict)
+            print("=== EncVelActorCritic : Load Critic Estimator Weights ===")
         return True  # training resumes
     def get_velocity_estimation(self)->torch.Tensor:
         if self.dis_vel_estimator and self.last_estimated_velocity is not None:
@@ -586,5 +611,10 @@ class EncVelActorCritic(nn.Module):
     def get_CENet_loss(self)->torch.Tensor:
         if self.CENet:
             return self.CENet_loss
+        else:
+            return None
+    def get_critic_estimation(self)->torch.Tensor:
+        if self.critic_estimator_enable and self.critic_estimated is not None:
+            return self.critic_estimated
         else:
             return None
