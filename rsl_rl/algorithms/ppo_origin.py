@@ -31,7 +31,6 @@ class PPO:
         gamma=0.99,
         lam=0.95,
         value_loss_coef=1.0,
-        velocity_loss_coef=1.0,
         entropy_coef=0.01,
         learning_rate=0.001,
         max_grad_norm=1.0,
@@ -42,18 +41,9 @@ class PPO:
         normalize_advantage_per_mini_batch=False,
         # TODO velocity estimation
         velocity_estimation_enabled: bool = True,
-        critic_estimator_slice = [87,88,89,90,91,92,93,94],
-        critic_estimator_enable: bool = False,
-        critic_loss_coef: float = 0.3,
-        # Critic estimator loss shaping
-        critic_force_loss_weight: float = 1.0,
-        critic_height_loss_weight: float = 1.0,
-        # Scale for force targets/preds (in Newtons). Loss is computed in scaled space:
-        #   MSE(force/scale, tgt/scale)
-        # This prevents large-magnitude forces (hundreds/thousands) from dominating.
-        critic_force_scale: float = 1000.0,
+        velocity_loss_coef=1,
         cnt = 0,
-        use_CENet: bool = True,
+        use_CENet: bool = False,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -123,18 +113,13 @@ class PPO:
                 if name.startswith("CENet."):
                     continue
                 ppo_params.append(p)
-            # NOTE: disable foreach to avoid foreach shape-mismatch crashes when some optimizer state tensors
-            # are stale (e.g. after changing model shapes / loading partially compatible checkpoints).
-            self.optimizer = optim.Adam(ppo_params, lr=learning_rate, foreach=False)
+            self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
 
             # 新增：CENet独立优化器
             self.cenet_optimizer = optim.Adam(self.policy.CENet.parameters(), lr=learning_rate * 0.5)
         else:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
             self.cenet_optimizer = None
-
-        # Lazily validate/repair optimizer state before first step.
-        self._optimizer_state_checked = False
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -156,12 +141,6 @@ class PPO:
         self.velocity_estimation_enabled = velocity_estimation_enabled
         print("PPO velocity_estimation_enabled:", self.velocity_estimation_enabled)
         self.velocity_loss_coef = velocity_loss_coef
-        self.critic_estimator_enable = critic_estimator_enable
-        self.critic_loss_coef = critic_loss_coef
-        self.critic_estimator_slice = critic_estimator_slice
-        self.critic_force_loss_weight = critic_force_loss_weight
-        self.critic_height_loss_weight = critic_height_loss_weight
-        self.critic_force_scale = critic_force_scale
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
@@ -240,15 +219,8 @@ class PPO:
 
         if self.velocity_estimation_enabled:
             mean_velocity_loss = 0
-        elif self.critic_estimator_enable:
-            mean_critic_loss = 0
-            mean_critic_force_loss = 0
-            mean_critic_height_loss = 0
         else:
             mean_velocity_loss = None
-            mean_critic_loss = None
-            mean_critic_force_loss = None
-            mean_critic_height_loss = None
         if self.use_CENet:
             mean_CENet_loss = 0
         # generator for mini batches
@@ -410,7 +382,6 @@ class PPO:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
-                
 
             # velocity estimation loss
             if self.velocity_estimation_enabled:
@@ -419,58 +390,14 @@ class PPO:
                 # compute the loss
                 vel_mse_loss = torch.nn.MSELoss()
                 privileged_obs = obs_batch['privileged']  
-                base_lin_vel_last_time = privileged_obs[:, -1, :3]
-                if velocity_network.shape != base_lin_vel_last_time.shape:
-                    raise RuntimeError(
-                        f"Velocity pred/target shape mismatch: pred={tuple(velocity_network.shape)}, "
-                        f"target={tuple(base_lin_vel_last_time.shape)}"
-                    )
-                # print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
-                # print("batch 0: estimated_velocity:", velocity_network[0])
+                base_lin_vel_last_time = privileged_obs[...,-1,:3] 
+                print("batch 0: base_lin_vel_last_time:", base_lin_vel_last_time[0]) 
+                print("batch 0: estimated_velocity:", velocity_network[0])
                 # print("privileged_obs shape:", privileged_obs.shape)
                 velocity_loss = vel_mse_loss(velocity_network, base_lin_vel_last_time.detach())
                 loss += self.velocity_loss_coef * velocity_loss
-                mean_velocity_loss += velocity_loss.item()  
-            if self.critic_estimator_enable:
-                print("Using critic estimator loss")
-                self.critic_estimated = self.policy.get_critic_estimation()
-                critic_obs = privileged_obs[...,-1,self.critic_estimator_slice] # 此处privilege还没拼接command，所以slice相对于AC中的需要减4
-                # Critic estimator loss (two-head): first 6 dims are forces, last 2 dims are feet heights.
-                # This avoids large-magnitude force terms dominating the small-magnitude height terms.
-                if self.critic_estimated is None:
-                    raise RuntimeError("critic_estimator_enable is True but policy.get_critic_estimation() returned None")
-                if self.critic_estimated.shape != critic_obs.shape:
-                    raise RuntimeError(
-                        f"critic_estimated shape {tuple(self.critic_estimated.shape)} != critic_obs shape {tuple(critic_obs.shape)}"
-                    )
-                if critic_obs.shape[-1] != 8:
-                    raise RuntimeError(f"Expected critic_obs last dim = 8 (force6+height2), got {critic_obs.shape[-1]}")
+                mean_velocity_loss += velocity_loss.item()
 
-                # split
-                force_tgt = critic_obs.detach()[..., :6]
-                height_tgt = critic_obs.detach()[..., 6:]
-                force_pred = self.critic_estimated[..., :6]
-                height_pred = self.critic_estimated[..., 6:]
-
-                # Compute force loss in scaled space to reduce magnitude dominance.
-                # Note: we keep gradients (do NOT detach preds).
-                if self.critic_force_scale <= 0:
-                    raise ValueError(f"critic_force_scale must be > 0, got {self.critic_force_scale}")
-                force_pred_s = force_pred / self.critic_force_scale
-                force_tgt_s = force_tgt / self.critic_force_scale
-
-                critic_force_loss = vel_mse_loss(force_pred_s, force_tgt_s)
-                critic_height_loss = vel_mse_loss(height_pred, height_tgt)
-
-                critic_loss = (
-                    self.critic_force_loss_weight * critic_force_loss
-                    + self.critic_height_loss_weight * critic_height_loss
-                )
-                loss += self.critic_loss_coef * critic_loss
-                mean_critic_loss += critic_loss.item()
-                mean_critic_force_loss += critic_force_loss.item()
-                mean_critic_height_loss += critic_height_loss.item()
-            
             # CENet loss：单独优化（不加入PPO总loss）
             if self.use_CENet:
                 CENet_loss = self.policy.compute_CENet_loss(obs_batch)
@@ -512,7 +439,6 @@ class PPO:
             # Apply the gradients
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-
             self.optimizer.step()
 
             # -- For RND
@@ -573,13 +499,6 @@ class PPO:
             else:
                 self.cnt = 0
             loss_dict["velocity_loss"] = mean_velocity_loss
-        if self.critic_estimator_enable:
-            mean_critic_loss /= num_updates
-            mean_critic_force_loss /= num_updates
-            mean_critic_height_loss /= num_updates
-            loss_dict["critic_loss"] = mean_critic_loss
-            loss_dict["critic_force_loss"] = mean_critic_force_loss
-            loss_dict["critic_height_loss"] = mean_critic_height_loss
         return loss_dict
 
     """
