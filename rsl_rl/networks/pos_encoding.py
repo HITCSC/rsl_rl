@@ -114,7 +114,7 @@ class AttentionEncoderBlock(nn.Module):
         h: int = 16,
         enable_pos_encoding: bool = True,
         pos_encoding_type: str = "learned",
-        pos_encoding_max_hw: tuple[int, int] = (17, 11),
+        pos_encoding_max_hw: tuple[int, int] = (64, 64),
     ):
         """
         :param d_obs: 本体感觉观测的维度(单次观测)
@@ -246,7 +246,7 @@ class AttentionMapEncoder(nn.Module):
         h=16,
         enable_pos_encoding: bool = True,
         pos_encoding_type: str = "learned",
-        pos_encoding_max_hw: tuple[int, int] = (17, 11),
+        pos_encoding_max_hw: tuple[int, int] = (64, 64),
     ):
         """
         :param d_obs: 本体感知向量的维度(单次观测)

@@ -103,6 +103,10 @@ class CENet(nn.Module):
             # 速度估计损失 L_est
             loss_est = F.mse_loss(v_est, v_true)
             # VAE损失：重建损失 + β*KL散度
+            # 这有问题：不同观测之间的数量级差距，需要归一化处理
+            o_recon = (o_recon - o_recon.mean(dim=1, keepdim=True)) / (o_recon.std(dim=1, keepdim=True) + 1e-6)
+            o_next_true = (o_next_true - o_next_true.mean(dim=1, keepdim=True)) / (o_next_true.std(dim=1, keepdim=True) + 1e-6)
+            
             loss_recon = F.mse_loss(o_recon, o_next_true)
             kl_div = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1).mean()
             loss_vae = loss_recon + self.beta * kl_div

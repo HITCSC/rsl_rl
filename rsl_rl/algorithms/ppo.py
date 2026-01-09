@@ -32,6 +32,7 @@ class PPO:
         lam=0.95,
         value_loss_coef=1.0,
         velocity_loss_coef=1.0,
+        # velocity_loss_coef=0.1,
         entropy_coef=0.01,
         learning_rate=0.001,
         max_grad_norm=1.0,
@@ -44,7 +45,7 @@ class PPO:
         velocity_estimation_enabled: bool = True,
         critic_estimator_slice = [87,88,89,90,91,92,93,94],
         critic_estimator_enable: bool = False,
-        critic_loss_coef: float = 0.3,
+        critic_loss_coef: float = 0.1,
         # Critic estimator loss shaping
         critic_force_loss_weight: float = 1.0,
         critic_height_loss_weight: float = 1.0,
@@ -157,6 +158,7 @@ class PPO:
         print("PPO velocity_estimation_enabled:", self.velocity_estimation_enabled)
         self.velocity_loss_coef = velocity_loss_coef
         self.critic_estimator_enable = critic_estimator_enable
+        print("PPO critic_estimator_enable:", self.critic_estimator_enable)
         self.critic_loss_coef = critic_loss_coef
         self.critic_estimator_slice = critic_estimator_slice
         self.critic_force_loss_weight = critic_force_loss_weight
@@ -227,30 +229,20 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        # -- RND loss
-        if self.rnd:
-            mean_rnd_loss = 0
-        else:
-            mean_rnd_loss = None
-        # -- Symmetry loss
-        if self.symmetry:
-            mean_symmetry_loss = 0
-        else:
-            mean_symmetry_loss = None
 
-        if self.velocity_estimation_enabled:
-            mean_velocity_loss = 0
-        elif self.critic_estimator_enable:
-            mean_critic_loss = 0
-            mean_critic_force_loss = 0
-            mean_critic_height_loss = 0
-        else:
-            mean_velocity_loss = None
-            mean_critic_loss = None
-            mean_critic_force_loss = None
-            mean_critic_height_loss = None
-        if self.use_CENet:
-            mean_CENet_loss = 0
+        # -- RND loss
+        mean_rnd_loss = 0 if self.rnd else None
+        # -- Symmetry loss
+        mean_symmetry_loss = 0 if self.symmetry else None
+
+        # --- fix: initialize independently (not mutually exclusive) ---
+        mean_velocity_loss = 0 if self.velocity_estimation_enabled else None
+
+        mean_critic_loss = 0 if self.critic_estimator_enable else None
+        mean_critic_force_loss = 0 if self.critic_estimator_enable else None
+        mean_critic_height_loss = 0 if self.critic_estimator_enable else None
+
+        mean_CENet_loss = 0 if self.use_CENet else None
         # generator for mini batches
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -432,7 +424,7 @@ class PPO:
                 loss += self.velocity_loss_coef * velocity_loss
                 mean_velocity_loss += velocity_loss.item()  
             if self.critic_estimator_enable:
-                print("Using critic estimator loss")
+                # print("Using critic estimator loss")
                 self.critic_estimated = self.policy.get_critic_estimation()
                 critic_obs = privileged_obs[...,-1,self.critic_estimator_slice] # 此处privilege还没拼接command，所以slice相对于AC中的需要减4
                 # Critic estimator loss (two-head): first 6 dims are forces, last 2 dims are feet heights.
@@ -449,6 +441,8 @@ class PPO:
                 # split
                 force_tgt = critic_obs.detach()[..., :6]
                 height_tgt = critic_obs.detach()[..., 6:]
+                # print("critic force target sample:", force_tgt[0])
+                # print("critic height target sample:", height_tgt[0])
                 force_pred = self.critic_estimated[..., :6]
                 height_pred = self.critic_estimated[..., 6:]
 
@@ -559,10 +553,11 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if self.use_CENet:
+        if self.use_CENet and mean_CENet_loss is not None:
             mean_CENet_loss /= num_updates
             loss_dict["CENet_loss"] = mean_CENet_loss
-        if self.velocity_estimation_enabled:
+
+        if self.velocity_estimation_enabled and mean_velocity_loss is not None:
             mean_velocity_loss /= num_updates
             # TODO 判断何时使用估计速度作为观测速度
             if mean_velocity_loss < 0.5 :
@@ -573,7 +568,8 @@ class PPO:
             else:
                 self.cnt = 0
             loss_dict["velocity_loss"] = mean_velocity_loss
-        if self.critic_estimator_enable:
+
+        if self.critic_estimator_enable and mean_critic_loss is not None:
             mean_critic_loss /= num_updates
             mean_critic_force_loss /= num_updates
             mean_critic_height_loss /= num_updates
