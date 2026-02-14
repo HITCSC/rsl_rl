@@ -172,9 +172,9 @@ class CNNActorCritic(nn.Module):
             obs_list.append(obs[obs_group])
         obs_tensor = torch.cat(obs_list, dim=-1)
         if self.actor_large_height_scan:
-            return obs_tensor[:, :161*101].view(obs_tensor.shape[0], 1, 161, 101), obs_tensor[:, 161*101:]
+            return obs_tensor[:, :101*161].view(obs_tensor.shape[0], 1, 101, 161), obs_tensor[:, 101*161:]
         else:
-            return obs_tensor[:, :17*11].view(obs_tensor.shape[0], 1, 17, 11), obs_tensor[:, 17*11:]
+            return obs_tensor[:, :11*17].view(obs_tensor.shape[0], 1, 11, 17), obs_tensor[:, 11*17:]
         
 
     def get_critic_obs(self, obs):
@@ -183,9 +183,9 @@ class CNNActorCritic(nn.Module):
             obs_list.append(obs[obs_group])
         obs_tensor = torch.cat(obs_list, dim=-1)
         if self.critic_large_height_scan:
-            return obs_tensor[:, :161*101].view(obs_tensor.shape[0], 1, 161, 101), obs_tensor[:, 161*101:]
+            return obs_tensor[:, :101*161].view(obs_tensor.shape[0], 1, 101, 161), obs_tensor[:, 101*161:]
         else:
-            return obs_tensor[:, :17*11].view(obs_tensor.shape[0], 1, 17, 11), obs_tensor[:, 17*11:]
+            return obs_tensor[:, :11*17].view(obs_tensor.shape[0], 1, 11, 17), obs_tensor[:, 11*17:]
         
 
     def get_actions_log_prob(self, actions):
