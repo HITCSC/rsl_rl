@@ -13,6 +13,7 @@ class SmallCNNEncoder(nn.Module):
             nn.Conv2d(16, 32, kernel_size=3), nn.ReLU(),
             nn.Flatten(),
             nn.Linear(32 * 7 * 13, embedding_dim),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -31,7 +32,8 @@ class LargeCNNEncoder(nn.Module):
             nn.Conv2d(16, 32, kernel_size=9, stride=2), nn.ReLU(),
             nn.AdaptiveAvgPool2d((16, 16)), 
             nn.Flatten(),
-            nn.Linear(32 * 16 * 16, embedding_dim)
+            nn.Linear(32 * 16 * 16, embedding_dim),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
