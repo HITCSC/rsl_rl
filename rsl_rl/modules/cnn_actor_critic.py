@@ -78,7 +78,7 @@ class CNNActorCritic(nn.Module):
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
+            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs - self.actor_cnn_encoder.embedding_dim)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
@@ -89,7 +89,7 @@ class CNNActorCritic(nn.Module):
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
+            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs - self.critic_cnn_encoder.embedding_dim)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
         print(f"Critic MLP: {self.critic}")
@@ -130,8 +130,9 @@ class CNNActorCritic(nn.Module):
         # compute embedding
         emb = self.actor_cnn_encoder(height_scan_obs)
         # compute mean
+        proprio_obs = self.actor_obs_normalizer(proprio_obs)
         obs = torch.cat([emb, proprio_obs], dim=-1)
-        obs = self.actor_obs_normalizer(obs)
+        
         mean = self.actor(obs)
         # compute standard deviation
         if self.noise_std_type == "scalar":
@@ -153,8 +154,9 @@ class CNNActorCritic(nn.Module):
         # compute embedding
         emb = self.actor_cnn_encoder(height_scan_obs)
         # compute mean
+        proprio_obs = self.actor_obs_normalizer(proprio_obs)
         obs = torch.cat([emb, proprio_obs], dim=-1)
-        obs = self.actor_obs_normalizer(obs)
+        
         return self.actor(obs)
 
     def evaluate(self, obs, **kwargs):
@@ -162,8 +164,9 @@ class CNNActorCritic(nn.Module):
         # compute embedding
         emb = self.critic_cnn_encoder(height_scan_obs)
         # compute critic input
+        proprio_obs = self.critic_obs_normalizer(proprio_obs)
         obs = torch.cat([emb, proprio_obs], dim=-1)
-        obs = self.critic_obs_normalizer(obs)
+        
         return self.critic(obs)
 
     def get_actor_obs(self, obs):
@@ -193,15 +196,11 @@ class CNNActorCritic(nn.Module):
 
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
-            actor_height_scan_obs, actor_proprio_obs = self.get_actor_obs(obs)
-            emb = self.actor_cnn_encoder(actor_height_scan_obs)
-            actor_obs = torch.cat([emb, actor_proprio_obs], dim=-1)
-            self.actor_obs_normalizer.update(actor_obs)
+            _, actor_proprio_obs = self.get_actor_obs(obs)
+            self.actor_obs_normalizer.update(actor_proprio_obs)
         if self.critic_obs_normalization:
-            critic_height_scan_obs, critic_proprio_obs = self.get_critic_obs(obs)
-            emb = self.critic_cnn_encoder(critic_height_scan_obs)
-            critic_obs = torch.cat([emb, critic_proprio_obs], dim=-1)
-            self.critic_obs_normalizer.update(critic_obs)
+            _, critic_proprio_obs = self.get_critic_obs(obs)
+            self.critic_obs_normalizer.update(critic_proprio_obs)
 
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
