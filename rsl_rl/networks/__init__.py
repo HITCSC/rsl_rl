@@ -8,4 +8,4 @@
 from .memory import Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
-from .cnn import SmallCNNEncoder, LargeCNNEncoder
+from .cnn import CNNEncoder

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rsl_rl.networks import MLP, EmpiricalNormalization, SmallCNNEncoder, LargeCNNEncoder
+from rsl_rl.networks import MLP, EmpiricalNormalization, CNNEncoder
 
 
 class CNNActorCritic(nn.Module):
@@ -27,8 +27,6 @@ class CNNActorCritic(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
-        actor_large_height_scan = True,
-        critic_large_height_scan = True,
         **kwargs,
     ):
         if kwargs:
@@ -39,14 +37,12 @@ class CNNActorCritic(nn.Module):
         super().__init__()
 
         # actor cnn encoder
-        self.actor_cnn_encoder = LargeCNNEncoder() if actor_large_height_scan else SmallCNNEncoder()
+        self.actor_cnn_encoder = CNNEncoder()
         print(f"Actor Encoder : {self.actor_cnn_encoder}")
-        self.actor_large_height_scan = actor_large_height_scan
 
         # critic cnn encoder
-        self.critic_cnn_encoder = LargeCNNEncoder() if critic_large_height_scan else SmallCNNEncoder()
+        self.critic_cnn_encoder = CNNEncoder()
         print(f"Critic Encoder : {self.critic_cnn_encoder}")
-        self.critic_large_height_scan = critic_large_height_scan
 
         # get the observation dimensions
         self.obs_groups = obs_groups
@@ -55,11 +51,11 @@ class CNNActorCritic(nn.Module):
         for obs_group in obs_groups["policy"]:
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             num_actor_obs += obs[obs_group].shape[-1]
-        if actor_large_height_scan:
-            num_actor_obs -= 161*101
-        else:
-            num_actor_obs -= 17*11
-        num_actor_obs += self.actor_cnn_encoder.embedding_dim
+        # if actor_large_height_scan:
+        #     num_actor_obs -= 161*101
+        # else:
+        #     num_actor_obs -= 17*11
+        # num_actor_obs += self.actor_cnn_encoder.embedding_dim
 
         num_critic_obs = 0
         print("obs_groups critic:", obs_groups["critic"])
@@ -67,29 +63,29 @@ class CNNActorCritic(nn.Module):
             print("obs_group:", obs_group)
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
-        if critic_large_height_scan:
-            num_critic_obs -= 161*101
-        else:
-            num_critic_obs -= 17*11
-        num_critic_obs += self.critic_cnn_encoder.embedding_dim
+        # if critic_large_height_scan:
+        #     num_critic_obs -= 161*101
+        # else:
+        #     num_critic_obs -= 17*11
+        # num_critic_obs += self.critic_cnn_encoder.embedding_dim
 
         # actor
-        self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
+        self.actor = MLP(num_actor_obs + self.actor_cnn_encoder.embedding_dim, num_actions, actor_hidden_dims, activation)
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs - self.actor_cnn_encoder.embedding_dim)
+            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
 
         
         # critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        self.critic = MLP(num_critic_obs + self.critic_cnn_encoder.embedding_dim, 1, critic_hidden_dims, activation)
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs - self.critic_cnn_encoder.embedding_dim)
+            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
         print(f"Critic MLP: {self.critic}")
@@ -126,14 +122,14 @@ class CNNActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, proprio_obs, height_scan_obs):
+    def update_distribution(self, proprio_obs, perception_obs):
         # compute embedding
-        emb = self.actor_cnn_encoder(height_scan_obs)
+        emb = self.actor_cnn_encoder(self.perception_reshape(perception_obs))
         # compute mean
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
-        obs = torch.cat([emb, proprio_obs], dim=-1)
+        x = torch.cat([emb, proprio_obs], dim=-1)
         
-        mean = self.actor(obs)
+        mean = self.actor(x)
         # compute standard deviation
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
@@ -145,50 +141,69 @@ class CNNActorCritic(nn.Module):
         self.distribution = Normal(mean, std)
 
     def act(self, obs, **kwargs):
-        height_scan_obs, proprio_obs = self.get_actor_obs(obs)
-        self.update_distribution(proprio_obs, height_scan_obs)
+        proprio_obs = self.get_actor_obs(obs)
+        perception_obs = self.get_actor_perception(obs)
+        self.update_distribution(proprio_obs, perception_obs)
         return self.distribution.sample()
 
     def act_inference(self, obs):
-        height_scan_obs, proprio_obs = self.get_actor_obs(obs)
+        proprio_obs = self.get_actor_obs(obs)
+        perception = self.get_actor_perception(obs)
         # compute embedding
-        emb = self.actor_cnn_encoder(height_scan_obs)
+        emb = self.actor_cnn_encoder(self.perception_reshape(perception))
         # compute mean
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
-        obs = torch.cat([emb, proprio_obs], dim=-1)
+        x = torch.cat([emb, proprio_obs], dim=-1)
         
-        return self.actor(obs)
+        return self.actor(x)
 
     def evaluate(self, obs, **kwargs):
-        height_scan_obs, proprio_obs = self.get_critic_obs(obs)
+        proprio_obs = self.get_critic_obs(obs)
+        perception = self.get_critic_perception(obs)
         # compute embedding
-        emb = self.critic_cnn_encoder(height_scan_obs)
+        emb = self.critic_cnn_encoder(self.perception_reshape(perception))
         # compute critic input
         proprio_obs = self.critic_obs_normalizer(proprio_obs)
-        obs = torch.cat([emb, proprio_obs], dim=-1)
+        x = torch.cat([emb, proprio_obs], dim=-1)
         
-        return self.critic(obs)
+        return self.critic(x)
 
     def get_actor_obs(self, obs):
         obs_list = []
         for obs_group in self.obs_groups["policy"]:
             obs_list.append(obs[obs_group])
-        obs_tensor = torch.cat(obs_list, dim=-1)
-        if self.actor_large_height_scan:
-            return obs_tensor[:, :101*161].view(obs_tensor.shape[0], 1, 101, 161), obs_tensor[:, 101*161:]
-        else:
-            return obs_tensor[:, :11*17].view(obs_tensor.shape[0], 1, 11, 17), obs_tensor[:, 11*17:]
+        return torch.cat(obs_list, dim=-1)
+    
+    def get_actor_perception(self, obs):
+        obs_list = []
+        for obs_group in self.obs_groups["policy_perception"]:
+            obs_list.append(obs[obs_group])
         
+        return torch.cat(obs_list, dim=-1)
+        
+    
+    def perception_reshape(self, perception_obs):
+        if perception_obs.shape[-1] == 161*101:
+            perception_obs = perception_obs.view(-1, 1, 161, 101)
+        elif perception_obs.shape[-1] == 17*11:
+            perception_obs = perception_obs.view(-1, 1, 17, 11)
+        else:
+            raise ValueError(f"Unexpected height scan shape: {perception_obs.shape}")
+        return perception_obs
 
     def get_critic_obs(self, obs):
         obs_list = []
         for obs_group in self.obs_groups["critic"]:
             obs_list.append(obs[obs_group])
-        obs_tensor = torch.cat(obs_list, dim=-1)
-        if self.critic_large_height_scan:
-            return obs_tensor[:, :101*161].view(obs_tensor.shape[0], 1, 101, 161), obs_tensor[:, 101*161:]
-        else:
-            return obs_tensor[:, :11*17].view(obs_tensor.shape[0], 1, 11, 17), obs_tensor[:, 11*17:]
+        return torch.cat(obs_list, dim=-1)
+    
+    def get_critic_perception(self, obs):
+        obs_list = []
+        for obs_group in self.obs_groups["critic_perception"]:
+            obs_list.append(obs[obs_group])
+        
+        return torch.cat(obs_list, dim=-1)
+        
         
 
     def get_actions_log_prob(self, actions):
@@ -196,10 +211,10 @@ class CNNActorCritic(nn.Module):
 
     def update_normalization(self, obs):
         if self.actor_obs_normalization:
-            _, actor_proprio_obs = self.get_actor_obs(obs)
+            actor_proprio_obs = self.get_actor_obs(obs)
             self.actor_obs_normalizer.update(actor_proprio_obs)
         if self.critic_obs_normalization:
-            _, critic_proprio_obs = self.get_critic_obs(obs)
+            critic_proprio_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_proprio_obs)
 
     def load_state_dict(self, state_dict, strict=True):
