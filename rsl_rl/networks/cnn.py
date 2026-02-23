@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class CNNEncoder(nn.Module):
-    def __init__(self, in_channels=1, embedding_dim=256, target_size=(128, 128)):
+    def __init__(self, in_channels=1, embedding_dim=128, target_size=(128, 128)):
         super(CNNEncoder, self).__init__()
         
         # 目标统一尺寸
@@ -21,17 +21,17 @@ class CNNEncoder(nn.Module):
             )
 
         # 网络结构
-        self.layer1 = conv_block(in_channels, 32)
-        self.layer2 = conv_block(32, 64)
-        self.layer3 = conv_block(64, 128)
-        self.layer4 = conv_block(128, 256)
+        self.layer1 = conv_block(in_channels, 16)
+        self.layer2 = conv_block(16, 32)
+        self.layer3 = conv_block(32, 64)
+        self.layer4 = conv_block(64, 128)
         
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         
         self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256, embedding_dim), 
+            nn.Linear(128, embedding_dim), 
             nn.Tanh()
         )
 
