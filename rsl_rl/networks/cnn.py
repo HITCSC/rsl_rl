@@ -24,7 +24,7 @@ class CNNEncoder(nn.Module):
         self.layer1 = conv_block(in_channels, 16)
         self.layer2 = conv_block(16, 32)
         self.layer3 = conv_block(32, 64)
-        self.layer4 = conv_block(64, 128)
+        # self.layer4 = conv_block(64, 128)
         
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -44,8 +44,9 @@ class CNNEncoder(nn.Module):
         # 特征提取
         x = self.pool(self.layer1(x))
         x = self.pool(self.layer2(x))
-        x = self.pool(self.layer3(x))
-        x = self.layer4(x)
+        x = self.layer3(x)
+        # x = self.pool(self.layer3(x))
+        # x = self.layer4(x)
         
         # 降维对齐
         x = self.adaptive_pool(x)
