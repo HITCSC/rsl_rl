@@ -183,8 +183,8 @@ class CNNActorCritic(nn.Module):
         
     
     def perception_reshape(self, perception_obs):
-        if perception_obs.shape[-1] == 81*51:
-            perception_obs = perception_obs.view(-1, 1, 81, 51)
+        if perception_obs.shape[-1] == 65*41:
+            perception_obs = perception_obs.view(-1, 1, 65, 41)
         elif perception_obs.shape[-1] == 17*11:
             perception_obs = perception_obs.view(-1, 1, 17, 11)
         else:
