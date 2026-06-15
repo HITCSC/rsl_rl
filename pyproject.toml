@@ -30,6 +30,8 @@ dependencies = [
     "tensordict>=0.7.0",
     "numpy>=1.16.4",
     "GitPython",
+    "huggingface-hub>=0.36.0",
+    "omegaconf>=2.3.0",
     "onnx",
     "onnxscript>=0.5.4",
 ]

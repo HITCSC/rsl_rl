@@ -115,6 +115,38 @@ class TestMiniBatchGenerator:
                 "Actions and values should index the same transitions"
             )
 
+    def test_nested_extra_uses_same_indices_as_rollout_tensors(self) -> None:
+        """Nested extra leaves should remain aligned with shuffled transition batches."""
+        storage, obs = _make_storage_and_obs()
+        for step in range(NUM_STEPS):
+            t = RolloutStorage.Transition()
+            t.observations = obs
+            t.extra = TensorDict(
+                {
+                    "actor_features": TensorDict(
+                        {"camera": torch.full((NUM_ENVS, 2), float(step))},
+                        batch_size=[NUM_ENVS],
+                    ),
+                    "critic_features": TensorDict(
+                        {"camera": torch.full((NUM_ENVS, 3), float(step) * 10)},
+                        batch_size=[NUM_ENVS],
+                    ),
+                },
+                batch_size=[NUM_ENVS],
+            )
+            t.actions = torch.full((NUM_ENVS, NUM_ACTIONS), float(step))
+            t.values = torch.full((NUM_ENVS, 1), float(step) * 10)
+            t.actions_log_prob = torch.zeros(NUM_ENVS)
+            t.distribution_params = (torch.zeros(NUM_ENVS, NUM_ACTIONS), torch.ones(NUM_ENVS, NUM_ACTIONS))
+            t.rewards = torch.zeros(NUM_ENVS)
+            t.dones = torch.zeros(NUM_ENVS)
+            storage.add_transition(t)
+
+        for batch in storage.mini_batch_generator(2, num_epochs=1):
+            assert batch.extra is not None
+            assert torch.allclose(batch.extra["actor_features", "camera"][:, 0], batch.actions[:, 0])
+            assert torch.allclose(batch.extra["critic_features", "camera"][:, 0], batch.values[:, 0])
+
 
 class TestRecurrentMiniBatchGenerator:
     """Tests for ``recurrent_mini_batch_generator`` — trajectory counting, env/trajectory alignment."""
@@ -234,6 +266,38 @@ class TestRecurrentMiniBatchGenerator:
         assert h1 is not None
         assert torch.allclose(h1, torch.zeros_like(h1)), "Envs without dones should all have step-0 hidden states"
 
+    def test_nested_extra_aligns_with_padded_observations(self) -> None:
+        """Nested extra should follow observation trajectory splitting and padding."""
+        storage, _obs = _make_storage_and_obs()
+        for step in range(NUM_STEPS):
+            env_ids = torch.arange(NUM_ENVS).float().unsqueeze(1)
+            t = RolloutStorage.Transition()
+            t.observations = TensorDict({"policy": env_ids.expand(-1, OBS_DIM)}, batch_size=[NUM_ENVS])
+            t.extra = TensorDict(
+                {
+                    "actor_features": TensorDict(
+                        {"camera": env_ids.expand(-1, 2)},
+                        batch_size=[NUM_ENVS],
+                    )
+                },
+                batch_size=[NUM_ENVS],
+            )
+            t.actions = env_ids.expand(-1, NUM_ACTIONS)
+            t.values = torch.zeros(NUM_ENVS, 1)
+            t.actions_log_prob = torch.zeros(NUM_ENVS)
+            t.distribution_params = (torch.zeros(NUM_ENVS, NUM_ACTIONS), torch.ones(NUM_ENVS, NUM_ACTIONS))
+            t.rewards = torch.zeros(NUM_ENVS)
+            t.dones = torch.zeros(NUM_ENVS)
+            if step == 3:
+                t.dones[0] = 1.0
+            storage.add_transition(t)
+
+        for batch in storage.recurrent_mini_batch_generator(2, num_epochs=1):
+            assert batch.extra is not None
+            valid_obs = batch.observations["policy"][batch.masks][:, 0]
+            valid_extra = batch.extra["actor_features", "camera"][batch.masks][:, 0]
+            assert torch.equal(valid_obs, valid_extra)
+
 
 class TestDistillationStorage:
     """Tests for distillation-mode storage."""
@@ -282,6 +346,29 @@ class TestStorageOverflow:
             t.rewards = torch.randn(NUM_ENVS)
             t.dones = torch.zeros(NUM_ENVS)
             storage.add_transition(t)
+
+
+class TestExtraStorage:
+    """Tests for transition-aligned extra schema validation."""
+
+    def test_extra_schema_cannot_change_during_rollout(self) -> None:
+        """Extra keys must remain fixed after allocation from the first transition."""
+        storage, obs = _make_storage_and_obs()
+        for step, key in enumerate(("feature_a", "feature_b")):
+            t = RolloutStorage.Transition()
+            t.observations = obs
+            t.extra = TensorDict({key: torch.zeros(NUM_ENVS, 2)}, batch_size=[NUM_ENVS])
+            t.actions = torch.zeros(NUM_ENVS, NUM_ACTIONS)
+            t.values = torch.zeros(NUM_ENVS, 1)
+            t.actions_log_prob = torch.zeros(NUM_ENVS)
+            t.distribution_params = (torch.zeros(NUM_ENVS, NUM_ACTIONS), torch.ones(NUM_ENVS, NUM_ACTIONS))
+            t.rewards = torch.zeros(NUM_ENVS)
+            t.dones = torch.zeros(NUM_ENVS)
+            if step == 0:
+                storage.add_transition(t)
+            else:
+                with pytest.raises(ValueError, match="extra keys changed"):
+                    storage.add_transition(t)
 
 
 class TestStorageClear:

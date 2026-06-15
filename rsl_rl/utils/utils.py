@@ -348,19 +348,18 @@ def split_and_pad_trajectories(
     trajectory_lengths_list = trajectory_lengths.tolist()
     # Extract the individual trajectories
     if isinstance(tensor, TensorDict):
-        padded_trajectories = {}
-        for k, v in tensor.items():
+        padded_trajectories = TensorDict({}, batch_size=[])
+        for k, v in tensor.items(include_nested=True, leaves_only=True):
             # Split the tensor into trajectories
             trajectories = torch.split(v.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
             # Add at least one full length trajectory
-            trajectories = (*trajectories, torch.zeros(v.shape[0], *v.shape[2:], device=v.device))
+            trajectories = (*trajectories, v.new_zeros(v.shape[0], *v.shape[2:]))
             # Pad the trajectories to the length of the longest trajectory
             padded_trajectories[k] = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
             # Remove the added trajectory
             padded_trajectories[k] = padded_trajectories[k][:, :-1]
-        padded_trajectories = TensorDict(
-            padded_trajectories, batch_size=[tensor.batch_size[0], len(trajectory_lengths_list)], device=tensor.device
-        )
+        padded_trajectories.batch_size = [tensor.batch_size[0], len(trajectory_lengths_list)]
+        padded_trajectories = padded_trajectories.to(tensor.device)
     else:
         # Split the tensor into trajectories
         trajectories = torch.split(tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)

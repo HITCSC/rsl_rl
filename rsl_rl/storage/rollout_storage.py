@@ -33,6 +33,9 @@ class RolloutStorage:
             self.observations: TensorDict | None = None
             """Observations at the current step."""
 
+            self.extra: TensorDict | None = None
+            """Optional tensors aligned with the current transition."""
+
             self.actions: torch.Tensor | None = None
             """Actions taken at the current step."""
 
@@ -74,6 +77,7 @@ class RolloutStorage:
         def __init__(
             self,
             observations: TensorDict | None = None,
+            extra: TensorDict | None = None,
             actions: torch.Tensor | None = None,
             values: torch.Tensor | None = None,
             advantages: torch.Tensor | None = None,
@@ -88,6 +92,9 @@ class RolloutStorage:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
             """Batch of observations."""
+
+            self.extra: TensorDict | None = extra
+            """Optional tensors aligned with the batch observations."""
 
             # For reinforcement learning
             self.actions: torch.Tensor | None = actions
@@ -144,6 +151,7 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
+        self.extra: TensorDict | None = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -175,6 +183,7 @@ class RolloutStorage:
 
         # Core
         self.observations[self.step].copy_(transition.observations)
+        self._save_extra(transition.extra)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -214,6 +223,7 @@ class RolloutStorage:
         for i in range(self.num_transitions_per_env):
             yield RolloutStorage.Batch(
                 observations=self.observations[i],  # type: ignore
+                extra=self.extra[i] if self.extra is not None else None,
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
             )
@@ -229,6 +239,7 @@ class RolloutStorage:
 
         # Flatten the data
         observations = self.observations.flatten(0, 1)
+        extra = self.extra.flatten(0, 1) if self.extra is not None else None
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
@@ -246,6 +257,7 @@ class RolloutStorage:
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
                     observations=observations[batch_idx],  # type: ignore
+                    extra=extra[batch_idx] if extra is not None else None,
                     actions=actions[batch_idx],
                     values=values[batch_idx],
                     advantages=advantages[batch_idx],
@@ -262,6 +274,9 @@ class RolloutStorage:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        padded_extra_trajectories = (
+            split_and_pad_trajectories(self.extra, self.dones)[0] if self.extra is not None else None
+        )
         mini_batch_size = self.num_envs // num_mini_batches
 
         for ep in range(num_epochs):
@@ -313,6 +328,11 @@ class RolloutStorage:
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
                     observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
+                    extra=(
+                        padded_extra_trajectories[:, first_traj:last_traj]
+                        if padded_extra_trajectories is not None
+                        else None
+                    ),
                     actions=self.actions[:, start:stop],
                     values=self.values[:, start:stop],
                     advantages=self.advantages[:, start:stop],
@@ -324,6 +344,53 @@ class RolloutStorage:
                 )
 
                 first_traj = last_traj
+
+    def _save_extra(self, extra: TensorDict | None) -> None:
+        """Store optional transition-aligned tensors using a schema fixed by the first transition."""
+        if extra is None:
+            if self.extra is not None:
+                raise ValueError("Transition extra is missing, but this rollout already has an extra schema.")
+            return
+        if extra.batch_size != torch.Size([self.num_envs]):
+            raise ValueError(
+                f"Transition extra must have batch size [{self.num_envs}], got {list(extra.batch_size)}."
+            )
+        if self.extra is None:
+            if self.step != 0:
+                raise ValueError("Transition extra must be provided from the first step of a rollout.")
+            # Rollout collection runs under inference mode, but learning needs ordinary tensors as MLP inputs.
+            with torch.inference_mode(False):
+                self.extra = extra.apply(
+                    lambda value: torch.zeros(
+                        self.num_transitions_per_env,
+                        *value.shape,
+                        dtype=value.dtype,
+                        device=self.device,
+                    ),
+                    batch_size=[self.num_transitions_per_env, self.num_envs],
+                )
+        self._validate_extra(extra)
+        self.extra[self.step].copy_(extra)
+
+    def _validate_extra(self, extra: TensorDict) -> None:
+        """Validate that an extra TensorDict matches the rollout's fixed schema."""
+        assert self.extra is not None
+        expected_keys = set(self.extra.keys(include_nested=True, leaves_only=True))
+        actual_keys = set(extra.keys(include_nested=True, leaves_only=True))
+        if actual_keys != expected_keys:
+            raise ValueError(f"Transition extra keys changed: expected {expected_keys}, got {actual_keys}.")
+        for key in expected_keys:
+            expected = self.extra[key][self.step]
+            actual = extra[key]
+            if actual.shape != expected.shape:
+                raise ValueError(
+                    f"Transition extra '{key}' shape changed: expected {tuple(expected.shape)}, "
+                    f"got {tuple(actual.shape)}."
+                )
+            if actual.dtype != expected.dtype:
+                raise ValueError(
+                    f"Transition extra '{key}' dtype changed: expected {expected.dtype}, got {actual.dtype}."
+                )
 
     def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
         """Save recurrent hidden states to the rollout storage."""

@@ -24,3 +24,10 @@ CNN Model
    :members:
    :undoc-members:
 
+
+DeFM Model
+----------
+
+.. automodule:: rsl_rl.models.defm_model
+   :members:
+   :undoc-members:

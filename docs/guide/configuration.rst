@@ -200,8 +200,8 @@ PPO
    * - ``share_cnn_encoders``
      - bool
      - ``False``
-     - Whether to share the CNN networks between actor and critic in case
-       the :class:`~rsl_rl.models.cnn_model.CNNModel` is used.
+     - Whether to share visual encoders between actor and critic when
+       :class:`~rsl_rl.models.cnn_model.CNNModel` or :class:`~rsl_rl.models.defm_model.DefmModel` is used.
    * - ``rnd_cfg``
      - dict | None
      - ``None``
@@ -257,8 +257,9 @@ Model Configuration
 Different algorithms use models for different purposes. For example, :class:`~rsl_rl.algorithms.ppo.PPO` uses an actor
 and a critic, while :class:`~rsl_rl.algorithms.distillation.Distillation` uses a student and a teacher. Even though
 their function might be different, they can all use the same underlying model classes. RSL-RL currently implements
-three different models: :class:`~rsl_rl.models.mlp_model.MLPModel`, :class:`~rsl_rl.models.rnn_model.RNNModel`, and
-:class:`~rsl_rl.models.cnn_model.CNNModel`, which are configured as follows.
+four different models: :class:`~rsl_rl.models.mlp_model.MLPModel`, :class:`~rsl_rl.models.rnn_model.RNNModel`,
+:class:`~rsl_rl.models.cnn_model.CNNModel`, and :class:`~rsl_rl.models.defm_model.DefmModel`, which are configured as
+follows.
 
 MLPModel
 ^^^^^^^^
@@ -415,6 +416,81 @@ configuration includes the following parameters:
      - bool
      - ``True``
      - Whether to flatten the output tensor.
+
+
+DefmModel
+^^^^^^^^^
+
+The :class:`~rsl_rl.models.defm_model.DefmModel` follows the same model interface as
+:class:`~rsl_rl.models.cnn_model.CNNModel`. Its depth inputs must contain raw metric depth in meters with shape
+``(B, H, W)`` or ``(B, 1, H, W)``. DeFM preprocessing is applied internally. Each final-layer Patch Token is reduced by
+fixed contiguous-channel group averaging, then the reduced tokens are flattened and concatenated with configured 1D
+observations.
+
+DeFM is loaded without installing its source package, using ``torch.hub.load``. On first use, TorchHub downloads and
+caches the repository source; pretrained models additionally download their weights. Only ``defm_vit_s14`` is currently
+supported. Because reduced Patch Tokens are flattened, depth observation dimensions must remain fixed after model
+construction. Frozen DeFM features are cached with rollout transitions and reused during PPO updates.
+
+The optional ``defm_cfg`` may be shared by all depth observation groups or keyed by depth observation group:
+
+.. list-table::
+   :header-rows: 1
+   :class: no-wrap-type-column
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``model_name``
+     - str
+     - ``"defm_vit_s14"``
+     - TorchHub model name. Other DeFM variants are not currently supported.
+   * - ``repo_or_dir``
+     - str
+     - ``"leggedrobotics/defm:main"``
+     - TorchHub repository reference. Pin this to a tag or commit for reproducible deployment.
+   * - ``pretrained``
+     - bool
+     - ``True``
+     - Whether to load official pretrained weights.
+   * - ``pretrained_path``
+     - str | None
+     - ``None``
+     - Optional local checkpoint path passed to the DeFM TorchHub entrypoint.
+   * - ``trainable``
+     - bool
+     - ``False``
+     - Whether to fine-tune the encoder. Frozen encoders remain in evaluation mode during training.
+   * - ``target_size``
+     - int | tuple[int, int] | None
+     - ``None``
+     - Preprocessing size. Dimensions are aligned down to multiples of the ViT patch size, 14.
+   * - ``token_feature_dim``
+     - int
+     - ``32``
+     - Output channels per Patch Token after fixed group averaging. Must be a positive divisor of 384.
+
+Example:
+
+.. code-block:: yaml
+
+   obs_groups:
+     actor: [policy, depth]
+     critic: [policy, depth]
+   actor:
+     class_name: DefmModel
+     hidden_dims: [256, 256]
+     defm_cfg:
+       pretrained: true
+       trainable: false
+       target_size: [140, 210]
+       token_feature_dim: 32
+   critic:
+     class_name: DefmModel
+     hidden_dims: [256, 256]
+   algorithm:
+     share_cnn_encoders: true
 
 
 Distribution Configuration

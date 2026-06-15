@@ -82,6 +82,12 @@ class PPO:
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+        self.cache_features = bool(
+            getattr(self.actor, "supports_feature_cache", False)
+            and getattr(self.critic, "supports_feature_cache", False)
+        )
+        if self.cache_features and self.symmetry:
+            raise ValueError("Symmetry augmentation is not supported when caching encoder features.")
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic``.
@@ -89,9 +95,12 @@ class PPO:
         self._raw_critic = self.critic
 
         # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        optimizer_parameters = {
+            id(parameter): parameter
+            for parameter in chain(self.actor.parameters(), self.critic.parameters())
+            if parameter.requires_grad
+        }
+        self.optimizer = resolve_optimizer(optimizer)(optimizer_parameters.values(), lr=learning_rate)  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -117,10 +126,28 @@ class PPO:
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
-        self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
-        self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
+        if self.cache_features:
+            actions, actor_features = self._raw_actor.forward_with_features(obs, stochastic_output=True)  # type: ignore
+            values, critic_features = self._raw_critic.forward_with_features(obs)  # type: ignore
+            self.transition.extra = TensorDict(
+                {
+                    "actor_features": actor_features,
+                    "critic_features": critic_features,
+                },
+                batch_size=obs.batch_size,
+                device=obs.device,
+            )
+            self.transition.actions = actions.detach()
+            self.transition.values = values.detach()
+            actor_model = self._raw_actor
+        else:
+            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+            self.transition.values = self.critic(obs).detach()
+            actor_model = self.actor
+        self.transition.actions_log_prob = actor_model.get_output_log_prob(  # type: ignore
+            self.transition.actions
+        ).detach()
+        self.transition.distribution_params = tuple(p.detach() for p in actor_model.output_distribution_params)
         # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
@@ -215,22 +242,41 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            if self.cache_features:
+                if batch.extra is None:
+                    raise RuntimeError("Cached-feature PPO requires rollout batch extra data.")
+                self._raw_actor.forward_from_features(  # type: ignore
+                    batch.observations,
+                    batch.extra["actor_features"],
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+                values = self._raw_critic.forward_from_features(  # type: ignore
+                    batch.observations,
+                    batch.extra["critic_features"],
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[1],
+                )
+                actor_model = self._raw_actor
+            else:
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                actor_model = self.actor
+            actions_log_prob = actor_model.get_output_log_prob(batch.actions)  # type: ignore
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
-            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-            entropy = self.actor.output_entropy[:original_batch_size]
+            distribution_params = tuple(p[:original_batch_size] for p in actor_model.output_distribution_params)
+            entropy = actor_model.output_entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                    kl = actor_model.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
                     kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs
@@ -428,7 +474,7 @@ class PPO:
         # Initialize the policy
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
         print(f"Actor Model: {actor}")
-        if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
+        if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share visual encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")

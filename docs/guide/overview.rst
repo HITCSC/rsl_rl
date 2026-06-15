@@ -48,6 +48,11 @@ Models
    independently. When used in conjunction with :class:`~rsl_rl.algorithms.ppo.PPO`, the encoders may be shared between
    actor and critic to save memory.
 
+:class:`~rsl_rl.models.defm_model.DefmModel`
+   A model for mixed 1D observations and raw metric-depth observations. It loads DeFM ViT-S/14 through TorchHub,
+   applies DeFM's metric-aware preprocessing, reduces and flattens the final patch tokens before passing them to the
+   policy MLP. The encoder is frozen by default; its rollout features are cached for PPO updates.
+
 Distributions
 ^^^^^^^^^^^^^
 
