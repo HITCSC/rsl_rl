@@ -36,6 +36,11 @@ dependencies = [
     "onnxscript>=0.5.4",
 ]
 
+[project.optional-dependencies]
+rgb = [
+    "jkp-depth-anything-v2>=0.1.1",
+]
+
 [project.urls]
 Homepage = "https://github.com/leggedrobotics/rsl_rl"
 Issues = "https://github.com/leggedrobotics/rsl_rl/issues"

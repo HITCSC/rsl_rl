@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from typing import Any
 
+from rsl_rl.models.cached_encoder_model import CachedEncoderModelMixin
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import HiddenState
-from rsl_rl.utils import unpad_trajectories
 
 
-class DefmModel(MLPModel):
+class DefmModel(CachedEncoderModelMixin, MLPModel):
     """DeFM-based neural model for mixed proprioceptive and metric-depth observations.
 
     Each depth observation is preprocessed using DeFM's metric-aware three-channel representation and encoded with a
@@ -39,6 +39,7 @@ class DefmModel(MLPModel):
         distribution_cfg: dict | None = None,
         defm_cfg: dict[str, dict] | dict[str, Any] | None = None,
         cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
+        encoder_feature_cache: bool = True,
     ) -> None:
         """Initialize the DeFM-based model.
 
@@ -53,8 +54,10 @@ class DefmModel(MLPModel):
             distribution_cfg: Configuration dictionary for the output distribution.
             defm_cfg: Shared DeFM configuration or a configuration per depth observation group.
             cnns: DeFM encoders to share with another model. The name is kept consistent with :class:`CNNModel`.
+            encoder_feature_cache: Whether frozen DeFM encoder features may be cached during PPO rollouts.
         """
         self._get_obs_dim(obs, obs_groups, obs_set)
+        self.encoder_feature_cache = encoder_feature_cache
 
         if cnns is not None:
             if not all(isinstance(encoder, _DefmEncoder) for encoder in cnns.values()):
@@ -91,67 +94,13 @@ class DefmModel(MLPModel):
         )
 
         self.cnns = cnns if isinstance(cnns, nn.ModuleDict) else nn.ModuleDict(cnns)
+        self.encoder_obs_groups = self.obs_groups_2d
 
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         """Combine normalized 1D observations with DeFM features."""
         return self.get_latent_from_features(obs, self._encode_features(obs, detach=False))
-
-    @property
-    def supports_feature_cache(self) -> bool:
-        """Whether all DeFM encoders are frozen and their features can be cached safely."""
-        return all(not encoder.trainable for encoder in self.cnns.values())  # type: ignore
-
-    def encode_features(self, obs: TensorDict) -> TensorDict:
-        """Encode depth observation groups into detached, transition-aligned features."""
-        return self._encode_features(obs, detach=True)
-
-    def _encode_features(self, obs: TensorDict, detach: bool) -> TensorDict:
-        """Encode depth observation groups, optionally detaching the resulting tensors."""
-        features = {group: self.cnns[group](obs[group]) for group in self.obs_groups_2d}
-        if detach:
-            features = {group: feature.detach() for group, feature in features.items()}
-        return TensorDict(features, batch_size=obs.batch_size, device=obs.device)
-
-    def get_latent_from_features(self, obs: TensorDict, features: TensorDict) -> torch.Tensor:
-        """Combine normalized 1D observations with precomputed DeFM features."""
-        latent_defm = torch.cat([features[group] for group in self.obs_groups_2d], dim=-1)
-        if not self.obs_groups:
-            return latent_defm
-        return torch.cat([super().get_latent(obs), latent_defm], dim=-1)
-
-    def forward_with_features(
-        self,
-        obs: TensorDict,
-        masks: torch.Tensor | None = None,
-        hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-    ) -> tuple[torch.Tensor, TensorDict]:
-        """Run the model and return the frozen DeFM features used by the policy head."""
-        features = self.encode_features(obs)
-        output = self.forward_from_features(obs, features, masks, hidden_state, stochastic_output)
-        return output, features
-
-    def forward_from_features(
-        self,
-        obs: TensorDict,
-        features: TensorDict,
-        masks: torch.Tensor | None = None,
-        hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-    ) -> torch.Tensor:
-        """Run the policy head from precomputed DeFM features."""
-        if masks is not None and not self.is_recurrent:
-            obs = unpad_trajectories(obs, masks)
-            features = unpad_trajectories(features, masks)
-        mlp_output = self.mlp(self.get_latent_from_features(obs, features))
-        if self.distribution is not None:
-            if stochastic_output:
-                self.distribution.update(mlp_output)
-                return self.distribution.sample()
-            return self.distribution.deterministic_output(mlp_output)
-        return mlp_output
 
     def train(self, mode: bool = True) -> DefmModel:
         """Set training mode while keeping frozen DeFM encoders in evaluation mode."""

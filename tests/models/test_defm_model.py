@@ -12,7 +12,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import PPO
-from rsl_rl.models import DefmModel
+from rsl_rl.models import CachedEncoderModelMixin, DefmModel
 from rsl_rl.storage import RolloutStorage
 
 NUM_ENVS = 4
@@ -82,6 +82,7 @@ def test_cached_features_match_regular_forward(monkeypatch) -> None:
     """Running the policy head from cached features should preserve deterministic output."""
     actor, _critic, obs, _mock_defm = _make_models(monkeypatch)
 
+    assert isinstance(actor, CachedEncoderModelMixin)
     features = actor.encode_features(obs)
     regular = actor(obs)
     cached = actor.forward_from_features(obs, features)
@@ -107,3 +108,19 @@ def test_ppo_update_does_not_reencode_cached_features(monkeypatch) -> None:
     assert mock_defm.forward_calls == calls_before_update
     assert ppo.storage.extra is not None
     assert not ppo.storage.extra["actor_features", "actor_depth"].is_inference()
+
+
+def test_feature_cache_can_be_disabled(monkeypatch) -> None:
+    """Configuration can disable rollout feature caching even for frozen DeFM encoders."""
+    actor, critic, obs, _mock_defm = _make_models(monkeypatch)
+    actor.encoder_feature_cache = False
+    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    ppo = PPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1, schedule="fixed")
+
+    with torch.inference_mode():
+        ppo.act(obs)
+        ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+
+    assert not actor.supports_feature_cache
+    assert not ppo.cache_features
+    assert ppo.storage.extra is None

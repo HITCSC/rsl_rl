@@ -5,14 +5,18 @@
 
 """Neural models for the learning algorithm."""
 
+from .cached_encoder_model import CachedEncoderModelMixin
 from .cnn_model import CNNModel
 from .defm_model import DefmModel
+from .depth_anything_v2_model import DepthAnythingV2Model
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
 __all__ = [
+    "CachedEncoderModelMixin",
     "CNNModel",
     "DefmModel",
+    "DepthAnythingV2Model",
     "MLPModel",
     "RNNModel",
 ]
