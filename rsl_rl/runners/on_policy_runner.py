@@ -13,7 +13,7 @@ import torch
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
-from rsl_rl.utils import check_nan, resolve_callable
+from rsl_rl.utils import check_nan, resolve_callable, sanitize_nan
 from rsl_rl.utils.logger import Logger
 
 
@@ -85,9 +85,12 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Check for NaN values from the environment
+                    # Sanitize NaN/Inf instead of crashing: replace bad values
+                    # with 0 and force the offending envs to done=True so they
+                    # auto-reset on the next step. Keeps long training runs
+                    # robust to rare physics divergence on individual envs.
                     if self.cfg.get("check_for_nan", True):
-                        check_nan(obs, rewards, dones)
+                        obs, rewards, dones, _ = sanitize_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step

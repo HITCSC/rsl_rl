@@ -292,6 +292,91 @@ def check_nan(obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor) -> No
         )
 
 
+def sanitize_nan(
+    obs: TensorDict,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    *,
+    fill_value: float = 0.0,
+    log_first: bool = True,
+) -> tuple[TensorDict, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replace NaN/Inf in env outputs and force the offending envs to done=1.
+
+    Why this exists: in long training runs (>= 1e5 steps) the MuJoCo solver
+    can occasionally diverge on a single environment after a rare combination
+    of domain randomization, extreme contact, and saturated control. The
+    resulting NaN qpos/qvel pollutes both actor and critic observations and
+    crashes ``check_nan`` even though 1023/1024 envs are still healthy. This
+    sanitizer turns those rare events into a forced reset:
+
+    - Tensors are scrubbed in place: NaN/+Inf/-Inf -> ``fill_value`` (default
+      0.0). The PPO update therefore never sees non-finite values.
+    - Envs with any non-finite obs or reward are marked ``done=True``; the
+      env's ``auto_reset`` path (mjlab's default) handles the actual state
+      reset on the next ``step()``.
+    - Rewards / dones are scrubbed too: NaN dones default to ``False`` and
+      then get OR'd with the offending mask.
+
+    Args:
+      obs: ``TensorDict`` with one entry per observation group, each shape
+        ``[num_envs, ...]``.
+      rewards: ``[num_envs]`` reward tensor.
+      dones: ``[num_envs]`` boolean / 0-1 tensor.
+      fill_value: value to substitute for NaN/Inf in obs and rewards.
+      log_first: if True, print a one-line warning the first time a NaN env
+        is detected per process so silent corruption is still surfaced.
+
+    Returns:
+      ``(obs, rewards, dones, bad_envs_mask)`` — the same containers (mutated
+      in place where possible) plus a boolean mask of which envs were forced
+      done.
+    """
+    if rewards.ndim == 0:
+        rewards = rewards.unsqueeze(0)
+
+    num_envs = rewards.shape[0]
+    bad = torch.zeros(num_envs, dtype=torch.bool, device=rewards.device)
+
+    for key, tensor in obs.items():
+        if tensor.numel() == 0:
+            continue
+        flat = tensor.view(tensor.shape[0], -1)
+        env_bad = ~torch.isfinite(flat).all(dim=1)
+        if env_bad.any():
+            obs[key] = torch.nan_to_num(
+                tensor, nan=fill_value, posinf=fill_value, neginf=fill_value
+            )
+            bad |= env_bad.to(bad.device)
+
+    reward_bad = ~torch.isfinite(rewards)
+    if reward_bad.any():
+        rewards = torch.nan_to_num(
+            rewards, nan=fill_value, posinf=fill_value, neginf=fill_value
+        )
+        bad |= reward_bad.to(bad.device)
+
+    if torch.isnan(dones).any():
+        dones = torch.nan_to_num(dones, nan=0.0)
+
+    if bad.any():
+        if dones.dtype == torch.bool:
+            dones = dones | bad
+        else:
+            dones = torch.maximum(dones, bad.to(dones.dtype))
+
+        if log_first and not getattr(sanitize_nan, "_warned", False):
+            sanitize_nan._warned = True  # type: ignore[attr-defined]
+            bad_ids = bad.nonzero(as_tuple=False).flatten().tolist()
+            print(
+                f"[sanitize_nan] First NaN/Inf detected in {bad.sum().item()} env(s): "
+                f"{bad_ids[:8]}{'...' if len(bad_ids) > 8 else ''}. "
+                f"Replacing with {fill_value} and forcing done=True. "
+                f"Further occurrences will be silent."
+            )
+
+    return obs, rewards, dones, bad
+
+
 def compile_model(model: torch.nn.Module, mode: str | None = None) -> torch.nn.Module:
     """Wrap a model with :func:`torch.compile`, validating the compile mode.
 
