@@ -78,3 +78,17 @@ class CachedEncoderModelMixin:
                 return self.distribution.sample()  # type: ignore
             return self.distribution.deterministic_output(mlp_output)  # type: ignore
         return mlp_output
+
+    def get_representation_from_features(
+        self,
+        obs: TensorDict,
+        features: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+    ) -> torch.Tensor:
+        """Return the hidden representation from precomputed encoder features."""
+        del hidden_state
+        if masks is not None and not self.is_recurrent:  # type: ignore
+            obs = unpad_trajectories(obs, masks)
+            features = unpad_trajectories(features, masks)
+        return self.mlp.forward_features(self.get_latent_from_features(obs, features))  # type: ignore

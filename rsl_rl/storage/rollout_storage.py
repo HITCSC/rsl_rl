@@ -229,10 +229,18 @@ class RolloutStorage:
             )
 
     # For reinforcement learning with feedforward networks
-    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
+    def mini_batch_generator(
+        self,
+        num_mini_batches: int,
+        num_epochs: int = 8,
+        next_obs_groups: list[str] | None = None,
+        final_obs: TensorDict | None = None,
+    ) -> Generator[Batch, None, None]:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        if next_obs_groups is not None and final_obs is None:
+            raise ValueError("final_obs must be provided when next_obs_groups is set.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
@@ -245,6 +253,7 @@ class RolloutStorage:
         returns = self.returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
+        dones = self.dones.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
         for epoch in range(num_epochs):
@@ -253,17 +262,21 @@ class RolloutStorage:
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
+                batch_extra = extra[batch_idx] if extra is not None else None
+                if next_obs_groups is not None:
+                    batch_extra = self._add_next_obs_prediction_extra(batch_idx, batch_extra, next_obs_groups, final_obs)  # type: ignore[arg-type]
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
                     observations=observations[batch_idx],  # type: ignore
-                    extra=extra[batch_idx] if extra is not None else None,
+                    extra=batch_extra,
                     actions=actions[batch_idx],
                     values=values[batch_idx],
                     advantages=advantages[batch_idx],
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    dones=dones[batch_idx],
                 )
 
     # For reinforcement learning with recurrent networks
@@ -391,6 +404,43 @@ class RolloutStorage:
                 raise ValueError(
                     f"Transition extra '{key}' dtype changed: expected {expected.dtype}, got {actual.dtype}."
                 )
+
+    def _add_next_obs_prediction_extra(
+        self,
+        batch_idx: torch.Tensor,
+        extra: TensorDict | None,
+        next_obs_groups: list[str],
+        final_obs: TensorDict,
+    ) -> TensorDict:
+        """Add lazily materialized next-observation prediction targets to a mini-batch extra dict."""
+        step_idx = batch_idx // self.num_envs
+        env_idx = batch_idx % self.num_envs
+        last_step = step_idx == self.num_transitions_per_env - 1
+        next_flat_idx = batch_idx + self.num_envs
+        target_parts = []
+        for group in next_obs_groups:
+            group_obs = self.observations[group].flatten(0, 1)
+            target = torch.empty(
+                batch_idx.shape[0],
+                *group_obs.shape[1:],
+                dtype=group_obs.dtype,
+                device=self.device,
+            )
+            if torch.any(~last_step):
+                target[~last_step] = group_obs[next_flat_idx[~last_step]]
+            if torch.any(last_step):
+                target[last_step] = final_obs[group][env_idx[last_step]]
+            target_parts.append(target)
+        target = torch.cat(target_parts, dim=-1)
+
+        if extra is None:
+            extra = TensorDict({}, batch_size=[batch_idx.shape[0]], device=self.device)
+        extra["next_obs_prediction"] = TensorDict(
+            {"target": target},
+            batch_size=[batch_idx.shape[0]],
+            device=self.device,
+        )
+        return extra
 
     def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
         """Save recurrent hidden states to the rollout storage."""

@@ -75,6 +75,15 @@ class TestMLPModelModes:
         expected = critic.mlp(latent)
         assert torch.allclose(output, expected)
 
+    def test_get_representation_returns_pre_output_features(self) -> None:
+        """get_representation() should expose the final hidden features."""
+        model, obs = _make_mlp_model(stochastic=False, obs_set="critic", hidden_dims=[16, 12])
+
+        representation = model.get_representation(obs)
+
+        assert representation.shape == (NUM_ENVS, 12)
+        assert torch.allclose(representation, model.mlp.forward_features(model.get_latent(obs)))
+
 
 class TestMLPModelNormalization:
     """Tests for observation normalization integration."""

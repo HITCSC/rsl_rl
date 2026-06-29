@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
@@ -223,6 +224,72 @@ class TestTimeoutBootstrapping:
         # Env 1 should have raw reward only
         stored_reward_env1 = ppo.storage.rewards[0, 1, 0].item()
         assert abs(stored_reward_env1 - 1.0) < 1e-5
+
+
+class TestNextObsPrediction:
+    """Tests for next-observation prediction auxiliary loss."""
+
+    def test_update_logs_next_obs_prediction_and_updates_predictor(self) -> None:
+        """A PPO update with next-observation prediction should optimize the auxiliary predictor."""
+        ppo, obs = _build_ppo(
+            num_learning_epochs=1,
+            num_mini_batches=2,
+            next_obs_prediction_cfg={
+                "target_obs_groups": ["policy"],
+                "loss_coef": 1.0,
+                "hidden_dims": [16],
+                "target_normalization": False,
+            },
+        )
+        assert ppo.next_obs_predictor is not None
+
+        for step in range(NUM_STEPS):
+            current_obs = TensorDict(
+                {"policy": torch.full((NUM_ENVS, OBS_DIM), float(step))},
+                batch_size=[NUM_ENVS],
+            )
+            next_obs = TensorDict(
+                {"policy": torch.full((NUM_ENVS, OBS_DIM), float(step + 1))},
+                batch_size=[NUM_ENVS],
+            )
+            ppo.act(current_obs)
+            ppo.process_env_step(next_obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+
+        final_obs = TensorDict(
+            {"policy": torch.full((NUM_ENVS, OBS_DIM), float(NUM_STEPS))},
+            batch_size=[NUM_ENVS],
+        )
+        ppo.compute_returns(final_obs)
+        before = [param.detach().clone() for param in ppo.next_obs_predictor.parameters()]
+        loss_dict = ppo.update()
+        after = list(ppo.next_obs_predictor.parameters())
+
+        assert "next_obs_prediction" in loss_dict
+        assert loss_dict["next_obs_prediction"] >= 0.0
+        assert any(not torch.allclose(old, new) for old, new in zip(before, after))
+
+    def test_recurrent_policy_rejects_next_obs_prediction(self) -> None:
+        """The first implementation intentionally rejects recurrent policies."""
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+        actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
+        actor.is_recurrent = True
+        critic = _make_critic(obs, obs_groups)
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+
+        with pytest.raises(ValueError, match="Next-observation prediction is not supported"):
+            PPO(actor, critic, storage, next_obs_prediction_cfg={"target_obs_groups": ["policy"]})
+
+    def test_loading_old_checkpoint_skips_optimizer_state_with_new_predictor(self) -> None:
+        """Old checkpoints without predictor state should still load actor and critic weights."""
+        old_ppo, _obs = _build_ppo()
+        loaded_dict = old_ppo.save()
+        new_ppo, _obs = _build_ppo(next_obs_prediction_cfg={"target_obs_groups": ["policy"]})
+
+        new_ppo.load(loaded_dict, load_cfg=None, strict=True)
+
+        for old_param, new_param in zip(old_ppo.actor.parameters(), new_ppo.actor.parameters()):
+            assert torch.allclose(old_param, new_param)
 
 
 class TestPPOLosses:

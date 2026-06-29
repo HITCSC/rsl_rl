@@ -49,6 +49,7 @@ class MLP(nn.Sequential):
         last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
         # Resolve number of hidden dims if they are -1
         hidden_dims_processed = [input_dim if dim == -1 else dim for dim in hidden_dims]
+        self.feature_dim = hidden_dims_processed[-1]
 
         # Create layers sequentially
         layers = []
@@ -61,11 +62,13 @@ class MLP(nn.Sequential):
 
         # Add last layer
         if isinstance(output_dim, int):
+            self.output_layer_idx = len(layers)
             layers.append(nn.Linear(hidden_dims_processed[-1], output_dim))
         else:
             # Compute the total output dimension
             total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # Add a layer to reshape the output to the desired shape
+            self.output_layer_idx = len(layers)
             layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
 
@@ -91,5 +94,13 @@ class MLP(nn.Sequential):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the MLP."""
         for layer in self:
+            x = layer(x)
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the hidden representation before the output layer."""
+        for idx, layer in enumerate(self):
+            if idx >= self.output_layer_idx:
+                break
             x = layer(x)
         return x

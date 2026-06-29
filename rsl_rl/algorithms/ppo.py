@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import MLP, EmpiricalNormalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -57,6 +58,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Next-observation prediction auxiliary loss
+        next_obs_prediction_cfg: dict | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -82,12 +85,25 @@ class PPO:
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+        self.storage = storage
         self.cache_features = bool(
             getattr(self.actor, "supports_feature_cache", False)
             and getattr(self.critic, "supports_feature_cache", False)
         )
         if self.cache_features and self.symmetry:
             raise ValueError("Symmetry augmentation is not supported when caching encoder features.")
+        if next_obs_prediction_cfg is not None and (actor.is_recurrent or critic.is_recurrent):
+            raise ValueError("Next-observation prediction is not supported for recurrent policies.")
+
+        # Next-observation prediction auxiliary loss
+        self.next_obs_predictor: MLP | None = None
+        self.next_obs_target_normalizer: EmpiricalNormalization | nn.Identity | None = None
+        self.next_obs_groups: list[str] | None = None
+        self.next_obs_loss_coef = 0.0
+        self.next_obs_mask_dones = True
+        self._rollout_final_obs: TensorDict | None = None
+        if next_obs_prediction_cfg is not None:
+            self._init_next_obs_prediction(next_obs_prediction_cfg)
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic``.
@@ -97,13 +113,16 @@ class PPO:
         # Create the optimizer
         optimizer_parameters = {
             id(parameter): parameter
-            for parameter in chain(self.actor.parameters(), self.critic.parameters())
+            for parameter in chain(
+                self.actor.parameters(),
+                self.critic.parameters(),
+                self.next_obs_predictor.parameters() if self.next_obs_predictor is not None else (),
+            )
             if parameter.requires_grad
         }
         self.optimizer = resolve_optimizer(optimizer)(optimizer_parameters.values(), lr=learning_rate)  # type: ignore
 
         # Add storage
-        self.storage = storage
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -210,12 +229,15 @@ class PPO:
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+        if self.next_obs_groups is not None:
+            self._rollout_final_obs = obs.select(*self.next_obs_groups)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_next_obs_loss = 0 if self.next_obs_predictor is not None else None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -225,7 +247,12 @@ class PPO:
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+                next_obs_groups=self.next_obs_groups,
+                final_obs=self._rollout_final_obs,
+            )
 
         # Iterate over mini-batches
         for batch in generator:
@@ -320,6 +347,11 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
+            # Next-observation prediction auxiliary loss
+            next_obs_loss = self._compute_next_obs_prediction_loss(batch, original_batch_size)
+            if next_obs_loss is not None:
+                loss = loss + self.next_obs_loss_coef * next_obs_loss
+
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
@@ -359,6 +391,8 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            if mean_next_obs_loss is not None:
+                mean_next_obs_loss += next_obs_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -369,6 +403,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_next_obs_loss is not None:
+            mean_next_obs_loss /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -380,9 +416,12 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.next_obs_predictor is not None:
+            loss_dict["next_obs_prediction"] = mean_next_obs_loss
 
         # Clear the storage
         self.storage.clear()
+        self._rollout_final_obs = None
 
         return loss_dict
 
@@ -392,6 +431,10 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.next_obs_predictor is not None:
+            self.next_obs_predictor.train()
+        if self.next_obs_target_normalizer is not None:
+            self.next_obs_target_normalizer.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -399,6 +442,10 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.next_obs_predictor is not None:
+            self.next_obs_predictor.eval()
+        if self.next_obs_target_normalizer is not None:
+            self.next_obs_target_normalizer.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -410,6 +457,10 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.next_obs_predictor is not None:
+            saved_dict["next_obs_predictor_state_dict"] = self.next_obs_predictor.state_dict()
+            if self.next_obs_target_normalizer is not None:
+                saved_dict["next_obs_target_normalizer_state_dict"] = self.next_obs_target_normalizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -422,6 +473,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "next_obs_prediction": True,
             }
 
         # Load the specified models
@@ -430,10 +482,32 @@ class PPO:
         if load_cfg.get("critic"):
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
-            self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            try:
+                self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            except ValueError:
+                if self.next_obs_predictor is None or "next_obs_predictor_state_dict" in loaded_dict:
+                    raise
+                print(
+                    "Skipping optimizer state load because the checkpoint predates "
+                    "next-observation prediction."
+                )
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if (
+            load_cfg.get("next_obs_prediction")
+            and self.next_obs_predictor
+            and "next_obs_predictor_state_dict" in loaded_dict
+        ):
+            self.next_obs_predictor.load_state_dict(loaded_dict["next_obs_predictor_state_dict"], strict=strict)
+            if (
+                self.next_obs_target_normalizer is not None
+                and "next_obs_target_normalizer_state_dict" in loaded_dict
+            ):
+                self.next_obs_target_normalizer.load_state_dict(
+                    loaded_dict["next_obs_target_normalizer_state_dict"],
+                    strict=strict,
+                )
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -496,6 +570,8 @@ class PPO:
         model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        if self.next_obs_predictor is not None:
+            model_params.append(self.next_obs_predictor.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
@@ -503,6 +579,8 @@ class PPO:
         self._raw_critic.load_state_dict(model_params[1])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
+        if self.next_obs_predictor is not None:
+            self.next_obs_predictor.load_state_dict(model_params[-1])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -511,6 +589,8 @@ class PPO:
         """
         # Create a tensor to store the gradients
         all_params = chain(self.actor.parameters(), self.critic.parameters())
+        if self.next_obs_predictor is not None:
+            all_params = chain(all_params, self.next_obs_predictor.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
@@ -528,3 +608,79 @@ class PPO:
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
                 offset += numel
+
+    def _init_next_obs_prediction(self, cfg: dict) -> None:
+        """Initialize the optional next-observation prediction auxiliary head."""
+        cfg = dict(cfg)
+        target_groups = cfg.pop("target_obs_groups", None)
+        if target_groups is None:
+            target_groups = [
+                group for group in self.actor.obs_groups if len(self.storage.observations[group].shape) == 3
+            ]
+        self.next_obs_groups = list(target_groups)
+        if not self.next_obs_groups:
+            raise ValueError("Next-observation prediction requires at least one 1D target observation group.")
+        for group in self.next_obs_groups:
+            if group not in self.storage.observations:
+                raise ValueError(f"Next-observation target group '{group}' is not in the environment observations.")
+            if len(self.storage.observations[group].shape) != 3:
+                raise ValueError(
+                    f"Next-observation target group '{group}' must be 1D, got {self.storage.observations[group].shape}."
+                )
+
+        target_dim = sum(self.storage.observations[group].shape[-1] for group in self.next_obs_groups)
+        self.next_obs_loss_coef = float(cfg.pop("loss_coef", 1.0))
+        hidden_dims = cfg.pop("hidden_dims", (256, 256))
+        activation = cfg.pop("activation", "elu")
+        target_normalization = bool(cfg.pop("target_normalization", True))
+        self.next_obs_mask_dones = bool(cfg.pop("mask_dones", True))
+        if cfg:
+            raise ValueError(f"Unsupported next_obs_prediction_cfg keys: {sorted(cfg)}")
+
+        self.next_obs_predictor = MLP(
+            self.actor.mlp.feature_dim,
+            target_dim,
+            hidden_dims,
+            activation,
+        ).to(self.device)
+        self.next_obs_target_normalizer = (
+            EmpiricalNormalization(target_dim).to(self.device) if target_normalization else nn.Identity()
+        )
+
+    def _compute_next_obs_prediction_loss(
+        self,
+        batch: RolloutStorage.Batch,
+        original_batch_size: int,
+    ) -> torch.Tensor | None:
+        """Compute the optional next-observation prediction auxiliary loss."""
+        if self.next_obs_predictor is None:
+            return None
+        if batch.extra is None or "next_obs_prediction" not in batch.extra:
+            raise RuntimeError("Next-observation prediction requires batch extra targets.")
+
+        observations = batch.observations[:original_batch_size]  # type: ignore[index]
+        if self.cache_features:
+            representation = self._raw_actor.get_representation_from_features(  # type: ignore[attr-defined]
+                observations,
+                batch.extra["actor_features"][:original_batch_size],
+                masks=None,
+                hidden_state=None,
+            )
+        else:
+            representation = self._raw_actor.get_representation(observations, masks=None, hidden_state=None)
+
+        target = batch.extra["next_obs_prediction", "target"][:original_batch_size]
+        assert self.next_obs_target_normalizer is not None
+        if isinstance(self.next_obs_target_normalizer, EmpiricalNormalization):
+            with torch.no_grad():
+                self.next_obs_target_normalizer.update(target)
+        target = self.next_obs_target_normalizer(target)
+
+        prediction = self.next_obs_predictor(representation)
+        sample_loss = (prediction - target).pow(2).mean(dim=-1)
+        if self.next_obs_mask_dones:
+            valid = ~batch.dones[:original_batch_size].bool().squeeze(-1)  # type: ignore[index]
+            if not torch.any(valid):
+                return sample_loss.mean() * 0.0
+            sample_loss = sample_loss[valid]
+        return sample_loss.mean()

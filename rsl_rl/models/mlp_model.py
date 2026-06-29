@@ -118,6 +118,13 @@ class MLPModel(nn.Module):
         latent = self.obs_normalizer(latent)
         return latent
 
+    def get_representation(
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+    ) -> torch.Tensor:
+        """Return the hidden representation before the model output layer."""
+        obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
+        return self.mlp.forward_features(self.get_latent(obs, masks, hidden_state))
+
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""
         pass

@@ -147,6 +147,44 @@ class TestMiniBatchGenerator:
             assert torch.allclose(batch.extra["actor_features", "camera"][:, 0], batch.actions[:, 0])
             assert torch.allclose(batch.extra["critic_features", "camera"][:, 0], batch.values[:, 0])
 
+    def test_next_obs_prediction_extra_uses_next_step_and_final_obs(self) -> None:
+        """Lazy next-observation targets should align with shuffled transition batches."""
+        obs = TensorDict({"policy": torch.zeros(NUM_ENVS, OBS_DIM)}, batch_size=[NUM_ENVS])
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        for step in range(NUM_STEPS):
+            env_ids = torch.arange(NUM_ENVS).float().unsqueeze(1)
+            encoded_obs = step * 100.0 + env_ids
+            t = RolloutStorage.Transition()
+            t.observations = TensorDict({"policy": encoded_obs.expand(-1, OBS_DIM)}, batch_size=[NUM_ENVS])
+            t.extra = TensorDict(
+                {"actor_features": TensorDict({"camera": encoded_obs.expand(-1, 2)}, batch_size=[NUM_ENVS])},
+                batch_size=[NUM_ENVS],
+            )
+            t.actions = torch.full((NUM_ENVS, NUM_ACTIONS), float(step))
+            t.values = torch.full((NUM_ENVS, 1), float(step))
+            t.actions_log_prob = torch.zeros(NUM_ENVS)
+            t.distribution_params = (torch.zeros(NUM_ENVS, NUM_ACTIONS), torch.ones(NUM_ENVS, NUM_ACTIONS))
+            t.rewards = torch.zeros(NUM_ENVS)
+            t.dones = torch.zeros(NUM_ENVS)
+            storage.add_transition(t)
+
+        final_env_ids = torch.arange(NUM_ENVS).float().unsqueeze(1)
+        final_obs = TensorDict({"policy": (1000.0 + final_env_ids).expand(-1, OBS_DIM)}, batch_size=[NUM_ENVS])
+        for batch in storage.mini_batch_generator(
+            num_mini_batches=1,
+            num_epochs=1,
+            next_obs_groups=["policy"],
+            final_obs=final_obs,
+        ):
+            assert batch.extra is not None
+            assert "actor_features" in batch.extra
+            current = batch.observations["policy"][:, 0]
+            step = torch.div(current, 100.0, rounding_mode="floor")
+            env_id = current - step * 100.0
+            expected = torch.where(step == NUM_STEPS - 1, 1000.0 + env_id, (step + 1.0) * 100.0 + env_id)
+            target = batch.extra["next_obs_prediction", "target"][:, 0]
+            assert torch.allclose(target, expected)
+
 
 class TestRecurrentMiniBatchGenerator:
     """Tests for ``recurrent_mini_batch_generator`` — trajectory counting, env/trajectory alignment."""
