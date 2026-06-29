@@ -15,6 +15,14 @@ except ModuleNotFoundError:
     raise ModuleNotFoundError("swanlab package is required to log to SwanLab.") from None
 
 
+_SWANLAB_SETTINGS_ENV = {
+    "api_key": "SWANLAB_API_KEY",
+    "api_host": "SWANLAB_API_HOST",
+    "web_host": "SWANLAB_WEB_HOST",
+    "mode": "SWANLAB_MODE",
+}
+
+
 class SwanLabSummaryWriter:
     """Summary writer for SwanLab."""
 
@@ -44,6 +52,13 @@ class SwanLabSummaryWriter:
         workspace = os.environ.get("SWANLAB_WORKSPACE")
         if workspace:
             init_kwargs["workspace"] = workspace
+        settings_kwargs = {
+            key: value
+            for key, env_name in _SWANLAB_SETTINGS_ENV.items()
+            if (value := os.environ.get(env_name))
+        }
+        if settings_kwargs:
+            init_kwargs["settings"] = swanlab.Settings(**settings_kwargs)
 
         self.run = swanlab.init(**init_kwargs)
 

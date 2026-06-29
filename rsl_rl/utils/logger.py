@@ -419,4 +419,9 @@ class Logger:
             )
             workspace = os.environ.get("SWANLAB_WORKSPACE")
             mode = os.environ.get("SWANLAB_MODE")
-            print(f"[INFO] SwanLab project: {project}, workspace: {workspace}, mode: {mode}")
+            api_host = os.environ.get("SWANLAB_API_HOST")
+            web_host = os.environ.get("SWANLAB_WEB_HOST")
+            print(
+                f"[INFO] SwanLab project: {project}, workspace: {workspace}, mode: {mode}, "
+                f"api_host: {api_host}, web_host: {web_host}"
+            )
