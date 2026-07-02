@@ -110,6 +110,16 @@ class TestCNNOutputDimComputation:
         actual_output = cnn(obs["image"])
         assert actual_output.shape == (NUM_ENVS, cnn.output_dim)
 
+    def test_adaptive_pool_sets_flattened_output_dim(self) -> None:
+        """Adaptive pooling should reduce spatial dimensions before flattening."""
+        model, obs = _make_cnn_model(cnn_cfg={"image": {**CNN_CFG, "adaptive_pool": (4, 4)}})
+        cnn = model.cnns["image"]
+
+        actual_output = cnn(obs["image"])
+
+        assert cnn.output_dim == 16 * 4 * 4
+        assert actual_output.shape == (NUM_ENVS, 16 * 4 * 4)
+
     def test_max_pool_halves_output(self) -> None:
         """Max pooling should roughly halve spatial dimensions."""
         h_out, w_out = _compute_output_dim((16, 16), kernel=3, stride=1, dilation=1, padding=(1, 1), is_max_pool=True)

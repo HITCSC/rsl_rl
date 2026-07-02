@@ -33,6 +33,7 @@ class CNN(nn.Sequential):
         activation: str = "elu",
         max_pool: bool | tuple[bool] | list[bool] = False,
         global_pool: str = "none",
+        adaptive_pool: int | tuple[int, int] | None = None,
         flatten: bool = True,
     ) -> None:
         """Initialize the CNN.
@@ -51,6 +52,7 @@ class CNN(nn.Sequential):
             max_pool: List of booleans indicating whether to apply max pooling after each convolutional layer or a
                 single boolean for all layers.
             global_pool: Global pooling type to apply at the end. Either 'none', 'max', or 'avg'.
+            adaptive_pool: Optional adaptive average pooling output size before flattening.
             flatten: Whether to flatten the output tensor.
         """
         super().__init__()
@@ -124,6 +126,14 @@ class CNN(nn.Sequential):
             raise ValueError(
                 f"Unsupported global pooling type: {global_pool}. Supported types are 'none', 'max', and 'avg'."
             )
+
+        if adaptive_pool is not None:
+            if global_pool != "none":
+                raise ValueError("adaptive_pool can only be used when global_pool='none'.")
+            if isinstance(adaptive_pool, int):
+                adaptive_pool = (adaptive_pool, adaptive_pool)
+            layers.append(nn.AdaptiveAvgPool2d(adaptive_pool))
+            last_dim = adaptive_pool
 
         # Apply flattening if specified
         if flatten:
