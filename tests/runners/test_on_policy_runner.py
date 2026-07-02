@@ -20,12 +20,19 @@ OBS_DIM = 8
 NUM_ACTIONS = 4
 MAX_EP_LEN = 50
 IMG_C, IMG_H, IMG_W = 1, 16, 16
+HEIGHT_SCAN_H, HEIGHT_SCAN_W = 17, 11
 
 
 class DummyEnv(VecEnv):
     """Minimal VecEnv that returns random observations and rewards."""
 
-    def __init__(self, device: str = "cpu", include_image: bool = False) -> None:  # noqa: D107
+    def __init__(
+        self,
+        device: str = "cpu",
+        include_image: bool = False,
+        include_height_scan: bool = False,
+        include_height_scan_flat: bool = False,
+    ) -> None:  # noqa: D107
         self.num_envs = NUM_ENVS
         self.num_actions = NUM_ACTIONS
         self.max_episode_length = MAX_EP_LEN
@@ -33,11 +40,19 @@ class DummyEnv(VecEnv):
         self.device = device
         self.cfg = {}
         self._include_image = include_image
+        self._include_height_scan = include_height_scan
+        self._include_height_scan_flat = include_height_scan_flat
 
     def get_observations(self) -> TensorDict:  # noqa: D102
         data: dict = {"policy": torch.randn(self.num_envs, OBS_DIM, device=self.device)}
         if self._include_image:
             data["image"] = torch.randn(self.num_envs, IMG_C, IMG_H, IMG_W, device=self.device)
+        if self._include_height_scan:
+            data["height_scan"] = torch.randn(self.num_envs, 1, HEIGHT_SCAN_H, HEIGHT_SCAN_W, device=self.device)
+        if self._include_height_scan_flat:
+            data["height_scan_flat"] = torch.randn(
+                self.num_envs, HEIGHT_SCAN_H * HEIGHT_SCAN_W, device=self.device
+            )
         return TensorDict(data, batch_size=[self.num_envs], device=self.device)
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:  # noqa: D102
@@ -109,6 +124,51 @@ def _make_train_cfg(model_type: str = "mlp") -> dict:
             "activation": "elu",
             "cnn_cfg": cnn_cfg,
         }
+    elif model_type == "height_scan_attention":
+        cfg["obs_groups"] = {
+            "actor": ["policy", "height_scan"],
+            "critic": ["policy", "height_scan"],
+        }
+        attention_cfg = {
+            "token_dim": 8,
+            "d_model": 16,
+            "n_heads": 4,
+            "n_queries": 2,
+            "output_dim": 24,
+        }
+        cfg["actor"] = {
+            "class_name": "HeightScanAttentionModel",
+            "hidden_dims": [32],
+            "activation": "elu",
+            "attention_cfg": attention_cfg,
+            "distribution_cfg": {
+                "class_name": "GaussianDistribution",
+            },
+        }
+        cfg["critic"] = {
+            "class_name": "HeightScanAttentionModel",
+            "hidden_dims": [32],
+            "activation": "elu",
+            "attention_cfg": attention_cfg,
+        }
+    elif model_type == "blind_height_scan_critic":
+        cfg["obs_groups"] = {
+            "actor": ["policy"],
+            "critic": ["policy", "height_scan_flat"],
+        }
+        cfg["actor"] = {
+            "class_name": "MLPModel",
+            "hidden_dims": [32, 32],
+            "activation": "elu",
+            "distribution_cfg": {
+                "class_name": "GaussianDistribution",
+            },
+        }
+        cfg["critic"] = {
+            "class_name": "MLPModel",
+            "hidden_dims": [32, 32],
+            "activation": "elu",
+        }
     else:
         cfg["actor"] = {
             "class_name": "MLPModel",
@@ -128,7 +188,11 @@ def _make_train_cfg(model_type: str = "mlp") -> dict:
 
 def _build_runner(log_dir: str | None = None, model_type: str = "mlp") -> OnPolicyRunner:
     """Construct a runner with a DummyEnv and minimal config."""
-    env = DummyEnv(include_image=(model_type == "cnn"))
+    env = DummyEnv(
+        include_image=(model_type == "cnn"),
+        include_height_scan=(model_type == "height_scan_attention"),
+        include_height_scan_flat=(model_type == "blind_height_scan_critic"),
+    )
     cfg = _make_train_cfg(model_type)
     return OnPolicyRunner(env, cfg, log_dir=log_dir, device="cpu")
 
@@ -147,6 +211,18 @@ class TestRunnerConstruction:
         """Initial learning iteration should be zero."""
         runner = _build_runner()
         assert runner.current_learning_iteration == 0
+
+    def test_runner_creates_height_scan_attention_algorithm(self) -> None:
+        """Runner should instantiate attention actor and critic from class names."""
+        runner = _build_runner(model_type="height_scan_attention")
+        assert runner.alg.actor.__class__.__name__ == "HeightScanAttentionModel"
+        assert runner.alg.critic.__class__.__name__ == "HeightScanAttentionModel"
+
+    def test_runner_creates_blind_actor_height_scan_critic_algorithm(self) -> None:
+        """Runner should support asymmetric MLP obs groups for blind actor training."""
+        runner = _build_runner(model_type="blind_height_scan_critic")
+        assert runner.alg.actor.obs_groups == ["policy"]
+        assert runner.alg.critic.obs_groups == ["policy", "height_scan_flat"]
 
 
 class TestLearnLoop:

@@ -9,6 +9,7 @@ from .cached_encoder_model import CachedEncoderModelMixin
 from .cnn_model import CNNModel
 from .defm_model import DefmModel
 from .depth_anything_v2_model import DepthAnythingV2Model
+from .height_scan_attention_model import HeightScanAttentionModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
@@ -17,6 +18,7 @@ __all__ = [
     "CNNModel",
     "DefmModel",
     "DepthAnythingV2Model",
+    "HeightScanAttentionModel",
     "MLPModel",
     "RNNModel",
 ]
