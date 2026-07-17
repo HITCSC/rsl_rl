@@ -12,7 +12,13 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.extensions import (
+    AMPDiscriminator,
+    RandomNetworkDistillation,
+    Symmetry,
+    resolve_rnd_config,
+    resolve_symmetry_config,
+)
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
@@ -55,6 +61,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # AMP parameters (scaffold; default-off — see rsl_rl/extensions/amp.py)
+        amp_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -79,6 +87,20 @@ class PPO:
             raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
         self.symmetry = Symmetry(**symmetry_cfg) if symmetry_cfg else None
 
+        # AMP extension (scaffold; default-off). Only constructed when a config is
+        # passed. ``amp_reward_coef`` mixes the style reward into the task reward
+        # during rollout; the remaining keys configure the discriminator.
+        self.amp = None
+        self.amp_reward_coef = 0.0
+        # Callable[[int], torch.Tensor] returning a batch of reference state
+        # sequences [n, seq_dim]. Left None in the scaffold (no dataset); attach
+        # via ``set_amp_reference_sampler`` once retargeted motion data exists.
+        self._amp_reference_sampler = None
+        if amp_cfg is not None:
+            amp_cfg = dict(amp_cfg)
+            self.amp_reward_coef = float(amp_cfg.pop("reward_coef", 1.0))
+            self.amp = AMPDiscriminator(device=self.device, **amp_cfg)
+
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
@@ -88,6 +110,8 @@ class PPO:
         )
         if self.cache_features and self.symmetry:
             raise ValueError("Symmetry augmentation is not supported when caching encoder features.")
+        if self.cache_features and self.amp:
+            raise ValueError("AMP is not supported when caching encoder features.")
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic``.
@@ -120,6 +144,17 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+    def set_amp_reference_sampler(self, sampler) -> None:
+        """Attach a reference-motion sampler to enable AMP discriminator training.
+
+        Scaffold hook: ``sampler(n)`` must return a ``[n, seq_dim]`` batch of
+        reference state sequences matching the policy AMP obs layout. Until this
+        is set (no dataset in-repo), AMP only shapes the style reward if a
+        discriminator is present and ``amp_obs`` is provided; the discriminator
+        itself is not trained. See ``doc/amp_scaffold.md``.
+        """
+        self._amp_reference_sampler = sampler
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -174,6 +209,20 @@ class PPO:
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
+        # AMP style reward (scaffold; default-off). The environment must provide
+        # the current AMP state sequence in ``extras["amp_obs"]`` ([B, seq_dim]);
+        # the discriminator turns it into a style reward mixed via
+        # ``amp_reward_coef``. The sequence is cached in ``transition.extra`` so
+        # the discriminator can be trained against it during ``update()``.
+        if self.amp is not None and "amp_obs" in extras:
+            amp_obs = extras["amp_obs"].to(self.device)
+            self.transition.rewards += self.amp_reward_coef * self.amp.style_reward(amp_obs)
+            extra = self.transition.extra
+            if extra is None:
+                extra = TensorDict({}, batch_size=obs.batch_size, device=obs.device)
+            extra["amp_obs"] = amp_obs.detach()
+            self.transition.extra = extra
+
         # Bootstrapping on time outs
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
@@ -220,6 +269,9 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # AMP discriminator loss (scaffold; only trains when a reference sampler
+        # is attached — see doc/amp_scaffold.md).
+        mean_amp_loss = 0 if (self.amp is not None and self._amp_reference_sampler is not None) else None
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -329,6 +381,21 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
+            # AMP discriminator loss (scaffold). Trains only when a reference
+            # sampler is attached AND the rollout carried AMP observations. The
+            # discriminator has its own optimizer (like RND), so it is stepped
+            # separately below.
+            amp_loss = None
+            if (
+                self.amp is not None
+                and self._amp_reference_sampler is not None
+                and batch.extra is not None
+                and "amp_obs" in batch.extra
+            ):
+                policy_seq = batch.extra["amp_obs"][:original_batch_size]
+                reference_seq = self._amp_reference_sampler(policy_seq.shape[0]).to(self.device)
+                amp_loss = self.amp.discriminator_loss(reference_seq, policy_seq)
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -336,6 +403,10 @@ class PPO:
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
+            # Compute the gradients for AMP
+            if amp_loss is not None:
+                self.amp.optimizer.zero_grad()
+                amp_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -348,6 +419,9 @@ class PPO:
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
+            # Apply the gradients for AMP
+            if amp_loss is not None:
+                self.amp.optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -359,6 +433,9 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # AMP discriminator loss
+            if mean_amp_loss is not None and amp_loss is not None:
+                mean_amp_loss += amp_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -369,6 +446,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if mean_amp_loss is not None:
+            mean_amp_loss /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -380,6 +459,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if mean_amp_loss is not None:
+            loss_dict["amp_discriminator"] = mean_amp_loss
 
         # Clear the storage
         self.storage.clear()
@@ -392,6 +473,8 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.amp:
+            self.amp.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -399,6 +482,8 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.amp:
+            self.amp.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""

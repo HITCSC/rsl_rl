@@ -8,11 +8,13 @@
 from .cnn_model import CNNModel
 from .defm_model import DefmModel
 from .mlp_model import MLPModel
+from .moe_model import MoEModel
 from .rnn_model import RNNModel
 
 __all__ = [
     "CNNModel",
     "DefmModel",
     "MLPModel",
+    "MoEModel",
     "RNNModel",
 ]
