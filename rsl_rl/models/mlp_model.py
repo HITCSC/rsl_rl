@@ -118,6 +118,23 @@ class MLPModel(nn.Module):
         latent = self.obs_normalizer(latent)
         return latent
 
+    def get_penultimate_features(self, obs: TensorDict) -> torch.Tensor:
+        """Return the penultimate MLP layer output (before the final linear layer).
+
+        This is used by vision distillation to align student and teacher
+        internal representations.  For ``hidden_dims=(512, 256, 128)`` the
+        returned tensor has shape ``(B, 128)``.
+
+        Subclasses that override :meth:`get_latent` (e.g. :class:`CNNModel`)
+        automatically route 2D observations through their encoders before the
+        shared MLP, so no override is required.
+        """
+        latent = self.get_latent(obs)
+        # Run all MLP layers except the last (final Linear / Unflatten)
+        for layer in list(self.mlp.children())[:-1]:
+            latent = layer(latent)
+        return latent
+
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""
         pass
