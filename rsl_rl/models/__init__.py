@@ -7,6 +7,7 @@
 
 from .cnn_model import CNNModel
 from .defm_model import DefmModel
+from .emp_teacher_model import EMPTeacherModel
 from .mlp_model import MLPModel
 from .moe_model import MoEModel
 from .rnn_model import RNNModel
@@ -14,6 +15,7 @@ from .rnn_model import RNNModel
 __all__ = [
     "CNNModel",
     "DefmModel",
+    "EMPTeacherModel",
     "MLPModel",
     "MoEModel",
     "RNNModel",

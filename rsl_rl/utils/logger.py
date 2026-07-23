@@ -183,8 +183,10 @@ class Logger:
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
 
-            # Log std
-            self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
+            # Behavior-cloning algorithms may not maintain a sampled action
+            # distribution. In that case the PPO-only std metric is omitted.
+            if action_std is not None:
+                self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
 
             # Log performance
             fps = int(collection_size / (collect_time + learn_time))
@@ -236,8 +238,9 @@ class Logger:
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
 
-            # Print std
-            log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""
+            # Print std when the algorithm maintains an action distribution.
+            if action_std is not None:
+                log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""
 
             # Print episode extras
             if not print_minimal:

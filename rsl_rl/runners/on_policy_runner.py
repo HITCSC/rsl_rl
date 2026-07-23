@@ -123,7 +123,11 @@ class OnPolicyRunner:
                 learn_time=learn_time,
                 loss_dict=loss_dict,
                 learning_rate=self.alg.learning_rate,
-                action_std=self.alg.get_policy().output_std,
+                action_std=(
+                    self.alg.get_policy().output_std
+                    if getattr(self.alg, "logs_action_std", True)
+                    else None
+                ),
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
             )
 

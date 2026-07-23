@@ -42,6 +42,19 @@ def _make_distillation_setup(gradient_length: int = 3, num_learning_epochs: int 
     return alg, obs, storage
 
 
+def _fill_distillation_storage_steps(alg: Distillation, obs: TensorDict, steps: int) -> None:
+    """Fill a configurable number of rollout slots for accumulation tests."""
+    for _ in range(steps):
+        t = RolloutStorage.Transition()
+        t.observations = obs
+        t.hidden_states = (None, None)
+        t.actions = alg.student(obs).detach()
+        t.privileged_actions = alg.teacher(obs).detach()
+        t.rewards = torch.zeros(NUM_ENVS)
+        t.dones = torch.zeros(NUM_ENVS)
+        alg.storage.add_transition(t)
+
+
 def _fill_distillation_storage(alg: Distillation, obs: TensorDict) -> None:
     """Fill the distillation storage with transitions."""
     for _ in range(NUM_STEPS):
@@ -112,3 +125,25 @@ class TestDistillationLoss:
 
         for name, p in alg.teacher.named_parameters():
             assert torch.equal(p, teacher_before[name]), f"Teacher parameter {name} changed during student update"
+
+    def test_partial_gradient_window_is_optimized(self) -> None:
+        """The last batches must not be dropped when steps are not divisible."""
+        obs = make_obs(NUM_ENVS, OBS_DIM)
+        obs_groups = {"student": ["policy"], "teacher": ["policy"]}
+        student = MLPModel(obs, obs_groups, "student", NUM_ACTIONS, hidden_dims=[32, 32])
+        teacher = MLPModel(obs, obs_groups, "teacher", NUM_ACTIONS, hidden_dims=[32, 32])
+        storage = RolloutStorage("distillation", NUM_ENVS, 5, obs, [NUM_ACTIONS])
+        alg = Distillation(student, teacher, storage, gradient_length=3, learning_rate=1e-3)
+        _fill_distillation_storage_steps(alg, obs, steps=5)
+
+        step_count = 0
+        original_step = alg.optimizer.step
+
+        def counting_step(*args: object, **kwargs: object) -> None:
+            nonlocal step_count
+            step_count += 1
+            return original_step(*args, **kwargs)
+
+        alg.optimizer.step = counting_step
+        alg.update()
+        assert step_count == 2

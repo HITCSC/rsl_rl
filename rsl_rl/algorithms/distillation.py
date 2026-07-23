@@ -28,6 +28,9 @@ class Distillation:
     teacher_loaded: bool = False
     """Indicates whether the teacher model parameters have been loaded."""
 
+    logs_action_std: bool = False
+    """Behavior cloning uses deterministic rollout actions, so PPO's action-std metric is undefined."""
+
     def __init__(
         self,
         student: MLPModel,
@@ -38,6 +41,7 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        student_rollout_stochastic: bool = False,
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -79,6 +83,10 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        # Distillation must collect states from the student's deploy-time policy.
+        # Sampling an untrained Gaussian policy sends the robot out of the frozen
+        # teacher's state distribution before the behavior loss can correct it.
+        self.student_rollout_stochastic = student_rollout_stochastic
 
         # Initialize the loss function
         loss_fn_dict = {
@@ -95,7 +103,9 @@ class Distillation:
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         # Compute the actions
-        self.transition.actions = self.student(obs, stochastic_output=True).detach()
+        self.transition.actions = self.student(
+            obs, stochastic_output=self.student_rollout_stochastic
+        ).detach()
         self.transition.privileged_actions = self.teacher(obs).detach()
         # Record the observations
         self.transition.observations = obs
@@ -125,7 +135,8 @@ class Distillation:
         """Run optimization epochs over stored batches and return mean losses."""
         self.num_updates += 1
         mean_behavior_loss = 0
-        loss = 0
+        accumulated_loss: torch.Tensor | None = None
+        accumulated_batches = 0
         cnt = 0
 
         for epoch in range(self.num_learning_epochs):
@@ -140,26 +151,43 @@ class Distillation:
                 behavior_loss = self.loss_fn(actions, batch.privileged_actions)
 
                 # Total loss
-                loss = loss + behavior_loss
+                accumulated_loss = (
+                    behavior_loss
+                    if accumulated_loss is None
+                    else accumulated_loss + behavior_loss
+                )
+                accumulated_batches += 1
                 mean_behavior_loss += behavior_loss.item()
                 cnt += 1
 
                 # Gradient step
-                if cnt % self.gradient_length == 0:
+                if accumulated_batches == self.gradient_length:
                     self.optimizer.zero_grad()
-                    loss.backward()
+                    (accumulated_loss / accumulated_batches).backward()
                     if self.is_multi_gpu:
                         self.reduce_parameters()
                     if self.max_grad_norm:
                         nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.student.detach_hidden_state()
-                    loss = 0
+                    accumulated_loss = None
+                    accumulated_batches = 0
 
                 # Reset dones
                 self.student.reset(batch.dones.view(-1))
                 self.teacher.reset(batch.dones.view(-1))
                 self.student.detach_hidden_state(batch.dones.view(-1))
+
+        # Do not silently discard the final partial gradient window.
+        if accumulated_loss is not None:
+            self.optimizer.zero_grad()
+            (accumulated_loss / accumulated_batches).backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+            if self.max_grad_norm:
+                nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            self.student.detach_hidden_state()
 
         mean_behavior_loss /= cnt
         self.storage.clear()
@@ -268,6 +296,7 @@ class Distillation:
         alg: Distillation = alg_class(
             student, teacher, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"]
         )
+        alg.teacher_loaded = bool(getattr(teacher, "is_loaded", False))
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
