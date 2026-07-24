@@ -5,6 +5,11 @@
 
 """Helper functions."""
 
+from .onnx_export import (
+    ReorderObsOnnx,
+    build_history_interleave_perm,
+    export_policy_to_onnx,
+)
 from .utils import (
     check_nan,
     compile_model,
@@ -29,4 +34,7 @@ __all__ = [
     "sanitize_nan",
     "split_and_pad_trajectories",
     "unpad_trajectories",
+    "ReorderObsOnnx",
+    "build_history_interleave_perm",
+    "export_policy_to_onnx",
 ]
