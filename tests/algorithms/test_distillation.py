@@ -11,7 +11,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.distillation import Distillation
-from rsl_rl.models import MLPModel
+from rsl_rl.models import CNNModel, MLPModel
 from rsl_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
@@ -176,3 +176,80 @@ class TestDistillationLoss:
         weighted = alg._compute_behavior_loss(student_actions, teacher_actions)
 
         assert weighted > unweighted
+
+    def test_masked_terrain_loss_ignores_invalid_cells(self) -> None:
+        """Invalid terrain targets must not contribute to either auxiliary loss."""
+        target = torch.zeros(1, 2, 3)
+        prediction = target.clone()
+        prediction[0, 0, 0] = 10.0
+        mask = torch.ones_like(target, dtype=torch.bool)
+        mask[0, 0, 0] = False
+
+        height_loss, gradient_loss = Distillation._compute_terrain_losses(
+            prediction, target, mask
+        )
+
+        assert height_loss.item() == 0.0
+        assert gradient_loss.item() == 0.0
+
+    def test_terrain_reconstruction_updates_spatial_encoder_and_decoder(self) -> None:
+        """Terrain reconstruction should backpropagate through the depth CNN."""
+        obs = TensorDict(
+            {
+                "policy": torch.randn(NUM_ENVS, OBS_DIM),
+                "depth": torch.randn(NUM_ENVS, 1, 16, 16),
+                "height": torch.randn(NUM_ENVS, 6),
+                "height_valid": torch.ones(NUM_ENVS, 6),
+            },
+            batch_size=[NUM_ENVS],
+        )
+        obs_groups = {
+            "student": ["policy", "depth"],
+            "teacher": ["policy"],
+        }
+        student = CNNModel(
+            obs,
+            obs_groups,
+            "student",
+            NUM_ACTIONS,
+            hidden_dims=[32],
+            cnn_cfg={
+                "depth": {
+                    "output_channels": [8, 16],
+                    "kernel_size": 3,
+                    "stride": 2,
+                    "padding": "zeros",
+                    "global_pool": "avg",
+                }
+            },
+        )
+        teacher = MLPModel(obs, obs_groups, "teacher", NUM_ACTIONS, hidden_dims=[32])
+        storage = RolloutStorage("distillation", NUM_ENVS, 2, obs, [NUM_ACTIONS])
+        alg = Distillation(
+            student,
+            teacher,
+            storage,
+            gradient_length=2,
+            terrain_reconstruction_loss_coef=0.1,
+            terrain_gradient_loss_coef=0.05,
+            terrain_target_obs_group="height",
+            terrain_mask_obs_group="height_valid",
+            terrain_target_shape=(2, 3),
+        )
+        cnn_before = next(student.cnns.parameters()).detach().clone()
+        decoder_before = next(alg.terrain_decoder.parameters()).detach().clone()  # type: ignore[union-attr]
+        for _ in range(2):
+            transition = RolloutStorage.Transition()
+            transition.observations = obs
+            transition.actions = student(obs).detach()
+            transition.privileged_actions = teacher(obs).detach()
+            transition.rewards = torch.zeros(NUM_ENVS)
+            transition.dones = torch.zeros(NUM_ENVS)
+            storage.add_transition(transition)
+
+        losses = alg.update()
+
+        assert "terrain_reconstruction" in losses
+        assert "terrain_gradient" in losses
+        assert not torch.equal(next(student.cnns.parameters()), cnn_before)
+        assert not torch.equal(next(alg.terrain_decoder.parameters()), decoder_before)  # type: ignore[union-attr]

@@ -122,6 +122,55 @@ class CNNModel(MLPModel):
             dim=-1,
         )
 
+    def get_visual_spatial_features(self, obs: TensorDict) -> torch.Tensor:
+        """Return the sole visual encoder's feature map before global pooling.
+
+        Spatial auxiliary objectives such as terrain reconstruction must retain
+        image layout. They therefore cannot use ``get_visual_latent()``, whose
+        configured global pooling deliberately removes that information.
+        """
+        if len(self.obs_groups_2d) != 1:
+            raise ValueError(
+                "Spatial visual features currently require exactly one 2D observation group."
+            )
+        spatial_features, _ = self._get_visual_spatial_and_latent(obs)
+        return spatial_features
+
+    def _get_visual_spatial_and_latent(
+        self, obs: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode one visual input once and retain its pre-pooling map."""
+        if len(self.obs_groups_2d) != 1:
+            raise ValueError(
+                "Spatial visual features currently require exactly one 2D observation group."
+            )
+        obs_group = self.obs_groups_2d[0]
+        x = obs[obs_group]
+        spatial_features = None
+        for layer in self.cnns[obs_group]:
+            if spatial_features is None and isinstance(
+                layer, (nn.AdaptiveAvgPool2d, nn.AdaptiveMaxPool2d, nn.Flatten)
+            ):
+                spatial_features = x
+            x = layer(x)
+        if spatial_features is None:
+            raise RuntimeError("The visual encoder must flatten its output after a spatial feature map.")
+        return spatial_features, x
+
+    @property
+    def visual_spatial_channels(self) -> int:
+        """Channel count of the sole visual encoder's pre-pooling map."""
+        if len(self.obs_groups_2d) != 1:
+            raise ValueError(
+                "Spatial visual features currently require exactly one 2D observation group."
+            )
+        convolutions = [
+            layer for layer in self.cnns[self.obs_groups_2d[0]] if isinstance(layer, nn.Conv2d)
+        ]
+        if not convolutions:
+            raise RuntimeError("The visual encoder has no convolutional layer.")
+        return convolutions[-1].out_channels
+
     def forward_with_visual_latent(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
         """Return deterministic actions together with the visual encoder latent.
 
@@ -136,6 +185,19 @@ class CNNModel(MLPModel):
         else:
             actions = mlp_output
         return actions, visual_latent
+
+    def forward_with_visual_spatial_features(
+        self, obs: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return deterministic actions and pre-pooling visual features."""
+        spatial_features, visual_latent = self._get_visual_spatial_and_latent(obs)
+        latent_1d = super().get_latent(obs)
+        mlp_output = self.mlp(torch.cat([latent_1d, visual_latent], dim=-1))
+        if self.distribution is not None:
+            actions = self.distribution.deterministic_output(mlp_output)
+        else:
+            actions = mlp_output
+        return actions, spatial_features
 
     @property
     def visual_latent_dim(self) -> int:

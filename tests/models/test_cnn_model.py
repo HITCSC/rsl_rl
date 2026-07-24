@@ -79,6 +79,20 @@ class TestCNNLatentConcatenation:
         cnn_start = model.obs_dim
         assert not torch.allclose(latent_before[:, cnn_start:], latent_after[:, cnn_start:], atol=1e-6)
 
+    def test_spatial_forward_reuses_policy_encoder_layout(self) -> None:
+        """Auxiliary features should retain image layout while actions stay unchanged."""
+        model, obs = _make_cnn_model(
+            cnn_cfg={
+                "image": {**CNN_CFG, "global_pool": "avg"},
+            }
+        )
+        expected_actions = model(obs)
+        actions, spatial_features = model.forward_with_visual_spatial_features(obs)
+
+        assert torch.allclose(actions, expected_actions, atol=1e-6)
+        assert spatial_features.ndim == 4
+        assert spatial_features.shape[:2] == (NUM_ENVS, model.visual_spatial_channels)
+
 
 class TestCNNOutputDimComputation:
     """Tests for the spatial dimension math in CNN layers."""

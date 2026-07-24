@@ -43,6 +43,11 @@ class Distillation:
         loss_type: str = "mse",
         action_loss_weights: tuple[float, ...] | list[float] | None = None,
         latent_loss_coef: float = 0.0,
+        terrain_reconstruction_loss_coef: float = 0.0,
+        terrain_gradient_loss_coef: float = 0.0,
+        terrain_target_obs_group: str = "teacher_height",
+        terrain_mask_obs_group: str | None = None,
+        terrain_target_shape: tuple[int, int] | list[int] = (7, 9),
         teacher_intervention_start: float = 0.0,
         teacher_intervention_end: float = 0.0,
         teacher_intervention_decay_updates: int = 1,
@@ -110,6 +115,37 @@ class Distillation:
                 raise TypeError("Latent distillation requires a teacher with a privileged latent interface.")
             self.latent_projection = nn.Linear(student_latent_dim, teacher_latent_dim).to(self.device)
 
+        self.terrain_reconstruction_loss_coef = float(terrain_reconstruction_loss_coef)
+        self.terrain_gradient_loss_coef = float(terrain_gradient_loss_coef)
+        if self.terrain_reconstruction_loss_coef < 0 or self.terrain_gradient_loss_coef < 0:
+            raise ValueError("Terrain reconstruction loss coefficients must be non-negative.")
+        if self.terrain_gradient_loss_coef > 0 and self.terrain_reconstruction_loss_coef == 0:
+            raise ValueError(
+                "terrain_gradient_loss_coef requires terrain_reconstruction_loss_coef > 0."
+            )
+        if len(terrain_target_shape) != 2 or any(size <= 0 for size in terrain_target_shape):
+            raise ValueError("terrain_target_shape must contain two positive dimensions.")
+        self.terrain_target_shape = tuple(int(size) for size in terrain_target_shape)
+        self.terrain_target_obs_group = terrain_target_obs_group
+        self.terrain_mask_obs_group = terrain_mask_obs_group
+        self.terrain_decoder: nn.Module | None = None
+        if self.terrain_reconstruction_loss_coef > 0:
+            if self.latent_projection is not None:
+                raise ValueError(
+                    "Global latent matching and terrain reconstruction are mutually exclusive."
+                )
+            spatial_channels = getattr(student, "visual_spatial_channels", None)
+            if spatial_channels is None or not hasattr(student, "forward_with_visual_spatial_features"):
+                raise TypeError(
+                    "Terrain reconstruction requires a student with a spatial visual feature interface."
+                )
+            self.terrain_decoder = nn.Sequential(
+                nn.Conv2d(spatial_channels, spatial_channels, kernel_size=3, padding=1),
+                nn.ELU(),
+                nn.Conv2d(spatial_channels, 1, kernel_size=1),
+                nn.AdaptiveAvgPool2d(self.terrain_target_shape),
+            ).to(self.device)
+
         for name, value in (
             ("teacher_intervention_start", teacher_intervention_start),
             ("teacher_intervention_end", teacher_intervention_end),
@@ -143,6 +179,8 @@ class Distillation:
         parameters = list(self.student.parameters())
         if self.latent_projection is not None:
             parameters.extend(self.latent_projection.parameters())
+        if self.terrain_decoder is not None:
+            parameters.extend(self.terrain_decoder.parameters())
         self.optimizer = resolve_optimizer(optimizer)(parameters, lr=learning_rate)  # type: ignore
 
     def act(self, obs: TensorDict) -> torch.Tensor:
@@ -224,6 +262,8 @@ class Distillation:
         self.num_updates += 1
         mean_behavior_loss = 0
         mean_latent_loss = 0 if self.latent_projection is not None else None
+        mean_terrain_loss = 0 if self.terrain_decoder is not None else None
+        mean_terrain_gradient_loss = 0 if self.terrain_decoder is not None else None
         accumulated_loss: torch.Tensor | None = None
         accumulated_batches = 0
         cnt = 0
@@ -236,7 +276,12 @@ class Distillation:
                 # Inference of the student for gradient computation. When
                 # enabled, reuse the same visual encoding for the action and
                 # representation objectives.
-                if self.latent_projection is not None:
+                spatial_features = None
+                if self.terrain_decoder is not None:
+                    actions, spatial_features = self.student.forward_with_visual_spatial_features(  # type: ignore
+                        batch.observations
+                    )
+                elif self.latent_projection is not None:
                     actions, visual_latent = self.student.forward_with_visual_latent(  # type: ignore
                         batch.observations
                     )
@@ -255,10 +300,32 @@ class Distillation:
                         predicted_latent, batch.privileged_latent
                     )
 
+                terrain_loss = None
+                terrain_gradient_loss = None
+                if self.terrain_decoder is not None:
+                    predicted_terrain = self.terrain_decoder(spatial_features).squeeze(1)
+                    terrain_target = batch.observations[self.terrain_target_obs_group].reshape(
+                        -1, *self.terrain_target_shape
+                    )
+                    terrain_mask = None
+                    if self.terrain_mask_obs_group is not None:
+                        terrain_mask = batch.observations[self.terrain_mask_obs_group].reshape(
+                            -1, *self.terrain_target_shape
+                        ).bool()
+                    terrain_loss, terrain_gradient_loss = self._compute_terrain_losses(
+                        predicted_terrain, terrain_target, terrain_mask
+                    )
+
                 # Total loss
                 total_batch_loss = behavior_loss
                 if latent_loss is not None:
                     total_batch_loss = total_batch_loss + self.latent_loss_coef * latent_loss
+                if terrain_loss is not None:
+                    total_batch_loss = (
+                        total_batch_loss
+                        + self.terrain_reconstruction_loss_coef * terrain_loss
+                        + self.terrain_gradient_loss_coef * terrain_gradient_loss
+                    )
                 accumulated_loss = (
                     total_batch_loss
                     if accumulated_loss is None
@@ -268,6 +335,9 @@ class Distillation:
                 mean_behavior_loss += behavior_loss.item()
                 if mean_latent_loss is not None:
                     mean_latent_loss += latent_loss.item()  # type: ignore[union-attr]
+                if mean_terrain_loss is not None:
+                    mean_terrain_loss += terrain_loss.item()  # type: ignore[union-attr]
+                    mean_terrain_gradient_loss += terrain_gradient_loss.item()  # type: ignore[union-attr]
                 cnt += 1
 
                 # Gradient step
@@ -302,6 +372,9 @@ class Distillation:
         mean_behavior_loss /= cnt
         if mean_latent_loss is not None:
             mean_latent_loss /= cnt
+        if mean_terrain_loss is not None:
+            mean_terrain_loss /= cnt
+            mean_terrain_gradient_loss /= cnt  # type: ignore[operator]
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
@@ -319,16 +392,43 @@ class Distillation:
         }
         if mean_latent_loss is not None:
             loss_dict["latent"] = mean_latent_loss
+        if mean_terrain_loss is not None:
+            loss_dict["terrain_reconstruction"] = mean_terrain_loss
+            loss_dict["terrain_gradient"] = mean_terrain_gradient_loss  # type: ignore[assignment]
         self._rollout_intervention_sum = 0.0
         self._rollout_intervention_steps = 0
 
         return loss_dict
+
+    @staticmethod
+    def _compute_terrain_losses(
+        prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute masked height and local-slope reconstruction losses."""
+        if mask is None:
+            mask = torch.ones_like(target, dtype=torch.bool)
+        valid_count = mask.sum().clamp_min(1)
+        height_error = nn.functional.smooth_l1_loss(prediction, target, reduction="none")
+        height_loss = (height_error * mask).sum() / valid_count
+
+        pred_dx = prediction[:, :, 1:] - prediction[:, :, :-1]
+        target_dx = target[:, :, 1:] - target[:, :, :-1]
+        mask_dx = mask[:, :, 1:] & mask[:, :, :-1]
+        pred_dy = prediction[:, 1:, :] - prediction[:, :-1, :]
+        target_dy = target[:, 1:, :] - target[:, :-1, :]
+        mask_dy = mask[:, 1:, :] & mask[:, :-1, :]
+        dx_loss = (nn.functional.smooth_l1_loss(pred_dx, target_dx, reduction="none") * mask_dx).sum()
+        dy_loss = (nn.functional.smooth_l1_loss(pred_dy, target_dy, reduction="none") * mask_dy).sum()
+        gradient_count = (mask_dx.sum() + mask_dy.sum()).clamp_min(1)
+        return height_loss, (dx_loss + dy_loss) / gradient_count
 
     def _trainable_parameters(self) -> list[nn.Parameter]:
         """Return student and auxiliary-head parameters for clipping/sync."""
         parameters = list(self.student.parameters())
         if self.latent_projection is not None:
             parameters.extend(self.latent_projection.parameters())
+        if self.terrain_decoder is not None:
+            parameters.extend(self.terrain_decoder.parameters())
         return parameters
 
     def train_mode(self) -> None:
@@ -336,6 +436,8 @@ class Distillation:
         self.student.train()
         if self.latent_projection is not None:
             self.latent_projection.train()
+        if self.terrain_decoder is not None:
+            self.terrain_decoder.train()
         # Teacher is always in eval mode
         self.teacher.eval()
 
@@ -344,6 +446,8 @@ class Distillation:
         self.student.eval()
         if self.latent_projection is not None:
             self.latent_projection.eval()
+        if self.terrain_decoder is not None:
+            self.terrain_decoder.eval()
         self.teacher.eval()
 
     def save(self) -> dict:
@@ -355,6 +459,8 @@ class Distillation:
         }
         if self.latent_projection is not None:
             saved_dict["latent_projection_state_dict"] = self.latent_projection.state_dict()
+        if self.terrain_decoder is not None:
+            saved_dict["terrain_decoder_state_dict"] = self.terrain_decoder.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -382,6 +488,8 @@ class Distillation:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if self.latent_projection is not None and "latent_projection_state_dict" in loaded_dict:
             self.latent_projection.load_state_dict(loaded_dict["latent_projection_state_dict"], strict=strict)
+        if self.terrain_decoder is not None and "terrain_decoder_state_dict" in loaded_dict:
+            self.terrain_decoder.load_state_dict(loaded_dict["terrain_decoder_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -462,6 +570,8 @@ class Distillation:
         model_params = [self._raw_student.state_dict(), self._raw_teacher.state_dict()]
         if self.latent_projection is not None:
             model_params.append(self.latent_projection.state_dict())
+        if self.terrain_decoder is not None:
+            model_params.append(self.terrain_decoder.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
@@ -469,6 +579,9 @@ class Distillation:
         self._raw_teacher.load_state_dict(model_params[1])
         if self.latent_projection is not None:
             self.latent_projection.load_state_dict(model_params[2])
+        if self.terrain_decoder is not None:
+            decoder_index = 3 if self.latent_projection is not None else 2
+            self.terrain_decoder.load_state_dict(model_params[decoder_index])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
