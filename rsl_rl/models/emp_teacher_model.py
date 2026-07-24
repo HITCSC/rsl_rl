@@ -46,6 +46,9 @@ class EMPTeacherModel(nn.Module):
     is_recurrent: bool = False
     """The teacher has no recurrent state."""
 
+    privileged_latent_dim: int = 64
+    """Dimensionality of the frozen EMP height-map representation."""
+
     def __init__(
         self,
         obs: TensorDict,
@@ -82,6 +85,18 @@ class EMPTeacherModel(nn.Module):
         Returns:
             Teacher actions ``[B, 26]`` (pre-scaling).
         """
+        teacher_input = self._build_teacher_input(obs)
+        actions = self.teacher_net(teacher_input)  # [B, 26] — Lab order
+        return self._actions_to_mjcf(actions)
+
+    def forward_with_latent(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return MJCF-ordered teacher actions and the frozen terrain latent."""
+        teacher_input = self._build_teacher_input(obs)
+        actions, terrain_latent = self.teacher_net.forward_with_latent(teacher_input)
+        return self._actions_to_mjcf(actions), terrain_latent
+
+    def _build_teacher_input(self, obs: TensorDict) -> torch.Tensor:
+        """Assemble the checkpoint-aligned 486-D EMP teacher input."""
         # The ``teacher_proprio`` group (420-dim) is in **term-major** order
         # from MJLab's observation manager — same as Isaac Lab during training.
         # We only need to reorder joint dims from MJCF (grouped) to Lab
@@ -91,11 +106,14 @@ class EMPTeacherModel(nn.Module):
         proprio = joint_order_mjcf_to_lab_term_major(obs["teacher_proprio"])
         # Build the 486-dim flat input in the exact order the teacher expects:
         #   [cmd(3), proprio(420), height(63)]
-        teacher_input = torch.cat(
+        return torch.cat(
             [obs["teacher_cmd"], proprio, obs["teacher_height"]],
             dim=-1,
         )
-        actions = self.teacher_net(teacher_input)  # [B, 26] — Lab order
+
+    @staticmethod
+    def _actions_to_mjcf(actions: torch.Tensor) -> torch.Tensor:
+        """Convert checkpoint USD/Lab action order to the MJCF environment order."""
         # The env expects actions in MJCF (qpos) order.  Convert here so that
         # distillation loss compares student (MJCF) and teacher (now MJCF) in
         # the same joint ordering.

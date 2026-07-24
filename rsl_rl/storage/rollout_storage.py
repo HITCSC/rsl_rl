@@ -59,6 +59,9 @@ class RolloutStorage:
             self.privileged_actions: torch.Tensor | None = None
             """Privileged (teacher) actions (distillation only)."""
 
+            self.privileged_latent: torch.Tensor | None = None
+            """Optional privileged representation target (distillation only)."""
+
             # For recurrent networks
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
             """Hidden states for recurrent networks, e.g., (actor, critic)."""
@@ -87,6 +90,7 @@ class RolloutStorage:
             hidden_states: tuple[HiddenState, HiddenState] = (None, None),
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
+            privileged_latent: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
@@ -117,7 +121,10 @@ class RolloutStorage:
 
             # For distillation
             self.privileged_actions: torch.Tensor | None = privileged_actions
-            """Batch of privileged (teacher) actions (distillation only)."""
+            """Batch of privileged (teacher) actions (distillation or hybrid RL)."""
+
+            self.privileged_latent: torch.Tensor | None = privileged_latent
+            """Batch of privileged representation targets (distillation only)."""
 
             self.dones: torch.Tensor | None = dones
             """Batch of done flags (distillation only)."""
@@ -137,6 +144,8 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        privileged_latent_dim: int | None = None,
+        store_privileged_actions: bool = False,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -157,8 +166,16 @@ class RolloutStorage:
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For distillation
-        if training_type == "distillation":
+        if training_type == "distillation" or store_privileged_actions:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        else:
+            self.privileged_actions = None
+        if training_type == "distillation" and privileged_latent_dim is not None:
+            self.privileged_latent = torch.zeros(
+                num_transitions_per_env, num_envs, privileged_latent_dim, device=self.device
+            )
+        else:
+            self.privileged_latent = None
 
         # For reinforcement learning
         if training_type == "rl":
@@ -189,8 +206,10 @@ class RolloutStorage:
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
-        if self.training_type == "distillation":
+        if self.privileged_actions is not None:
             self.privileged_actions[self.step].copy_(transition.privileged_actions)  # type: ignore
+        if self.privileged_latent is not None:
+            self.privileged_latent[self.step].copy_(transition.privileged_latent)  # type: ignore
 
         # For reinforcement learning
         if self.training_type == "rl":
@@ -225,6 +244,7 @@ class RolloutStorage:
                 observations=self.observations[i],  # type: ignore
                 extra=self.extra[i] if self.extra is not None else None,
                 privileged_actions=self.privileged_actions[i],
+                privileged_latent=(self.privileged_latent[i] if self.privileged_latent is not None else None),
                 dones=self.dones[i],
             )
 
@@ -246,6 +266,9 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        privileged_actions = (
+            self.privileged_actions.flatten(0, 1) if self.privileged_actions is not None else None
+        )
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -264,6 +287,9 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    privileged_actions=(
+                        privileged_actions[batch_idx] if privileged_actions is not None else None
+                    ),
                 )
 
     # For reinforcement learning with recurrent networks
@@ -339,6 +365,11 @@ class RolloutStorage:
                     returns=self.returns[:, start:stop],
                     old_actions_log_prob=self.actions_log_prob[:, start:stop],
                     old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore
+                    privileged_actions=(
+                        self.privileged_actions[:, start:stop]
+                        if self.privileged_actions is not None
+                        else None
+                    ),
                     hidden_states=(hidden_state_a_batch, hidden_state_c_batch),  # type: ignore
                     masks=trajectory_masks[:, first_traj:last_traj],
                 )

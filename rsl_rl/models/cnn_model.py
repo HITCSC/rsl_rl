@@ -111,10 +111,36 @@ class CNNModel(MLPModel):
         # Concatenate 1D observation groups and normalize
         latent_1d = super().get_latent(obs)
         # Process 2D observation groups with CNNs
-        latent_cnn_list = [self.cnns[obs_group](obs[obs_group]) for obs_group in self.obs_groups_2d]
-        latent_cnn = torch.cat(latent_cnn_list, dim=-1)
+        latent_cnn = self.get_visual_latent(obs)
         # Concatenate 1D and CNN latents
         return torch.cat([latent_1d, latent_cnn], dim=-1)
+
+    def get_visual_latent(self, obs: TensorDict) -> torch.Tensor:
+        """Encode only the 2D observation groups used by the visual policy."""
+        return torch.cat(
+            [self.cnns[obs_group](obs[obs_group]) for obs_group in self.obs_groups_2d],
+            dim=-1,
+        )
+
+    def forward_with_visual_latent(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return deterministic actions together with the visual encoder latent.
+
+        The auxiliary latent is used only while training privileged-information
+        distillation. It is deliberately excluded from exported inference models.
+        """
+        visual_latent = self.get_visual_latent(obs)
+        latent_1d = super().get_latent(obs)
+        mlp_output = self.mlp(torch.cat([latent_1d, visual_latent], dim=-1))
+        if self.distribution is not None:
+            actions = self.distribution.deterministic_output(mlp_output)
+        else:
+            actions = mlp_output
+        return actions, visual_latent
+
+    @property
+    def visual_latent_dim(self) -> int:
+        """Dimensionality of the concatenated visual encoder output."""
+        return self.cnn_latent_dim
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""

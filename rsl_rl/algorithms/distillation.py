@@ -41,6 +41,11 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        action_loss_weights: tuple[float, ...] | list[float] | None = None,
+        latent_loss_coef: float = 0.0,
+        teacher_intervention_start: float = 0.0,
+        teacher_intervention_end: float = 0.0,
+        teacher_intervention_decay_updates: int = 1,
         student_rollout_stochastic: bool = False,
         optimizer: str = "adam",
         device: str = "cpu",
@@ -70,9 +75,6 @@ class Distillation:
         self._raw_student = self.student
         self._raw_teacher = self.teacher
 
-        # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(self.student.parameters(), lr=learning_rate)  # type: ignore
-
         # Add storage
         self.storage = storage
         self.transition = RolloutStorage.Transition()
@@ -83,6 +85,44 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        if action_loss_weights is None:
+            self.action_loss_weights = None
+        else:
+            if len(action_loss_weights) != storage.actions_shape[0]:
+                raise ValueError(
+                    f"Expected {storage.actions_shape[0]} action loss weights, got {len(action_loss_weights)}."
+                )
+            weights = torch.as_tensor(action_loss_weights, dtype=torch.float, device=self.device)
+            if torch.any(weights <= 0):
+                raise ValueError("Action loss weights must all be positive.")
+            self.action_loss_weights = weights
+
+        self.latent_loss_coef = float(latent_loss_coef)
+        if self.latent_loss_coef < 0:
+            raise ValueError("latent_loss_coef must be non-negative.")
+        self.latent_projection: nn.Module | None = None
+        if self.latent_loss_coef > 0:
+            student_latent_dim = getattr(student, "visual_latent_dim", None)
+            teacher_latent_dim = getattr(teacher, "privileged_latent_dim", None)
+            if student_latent_dim is None or not hasattr(student, "forward_with_visual_latent"):
+                raise TypeError("Latent distillation requires a student with a visual latent interface.")
+            if teacher_latent_dim is None or not hasattr(teacher, "forward_with_latent"):
+                raise TypeError("Latent distillation requires a teacher with a privileged latent interface.")
+            self.latent_projection = nn.Linear(student_latent_dim, teacher_latent_dim).to(self.device)
+
+        for name, value in (
+            ("teacher_intervention_start", teacher_intervention_start),
+            ("teacher_intervention_end", teacher_intervention_end),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}.")
+        if teacher_intervention_decay_updates <= 0:
+            raise ValueError("teacher_intervention_decay_updates must be positive.")
+        self.teacher_intervention_start = float(teacher_intervention_start)
+        self.teacher_intervention_end = float(teacher_intervention_end)
+        self.teacher_intervention_decay_updates = int(teacher_intervention_decay_updates)
+        self._rollout_intervention_sum = 0.0
+        self._rollout_intervention_steps = 0
         # Distillation must collect states from the student's deploy-time policy.
         # Sampling an untrained Gaussian policy sends the robot out of the frozen
         # teacher's state distribution before the behavior loss can correct it.
@@ -100,16 +140,63 @@ class Distillation:
 
         self.num_updates = 0
 
+        parameters = list(self.student.parameters())
+        if self.latent_projection is not None:
+            parameters.extend(self.latent_projection.parameters())
+        self.optimizer = resolve_optimizer(optimizer)(parameters, lr=learning_rate)  # type: ignore
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
-        # Compute the actions
-        self.transition.actions = self.student(
-            obs, stochastic_output=self.student_rollout_stochastic
-        ).detach()
-        self.transition.privileged_actions = self.teacher(obs).detach()
+        student_actions = self.student(obs, stochastic_output=self.student_rollout_stochastic).detach()
+        if self.latent_projection is not None:
+            teacher_actions, privileged_latent = self.teacher.forward_with_latent(obs)  # type: ignore
+            self.transition.privileged_latent = privileged_latent.detach()
+        else:
+            teacher_actions = self.teacher(obs)
+        teacher_actions = teacher_actions.detach()
+
+        beta = self.teacher_intervention_beta
+        if beta <= 0:
+            intervention_mask = torch.zeros(
+                student_actions.shape[0], 1, dtype=torch.bool, device=student_actions.device
+            )
+        elif beta >= 1:
+            intervention_mask = torch.ones(
+                student_actions.shape[0], 1, dtype=torch.bool, device=student_actions.device
+            )
+        else:
+            intervention_mask = torch.rand(
+                student_actions.shape[0], 1, device=student_actions.device
+            ) < beta
+
+        # Select a whole action vector per environment. Joint-wise blending can
+        # create targets that neither policy considers dynamically consistent.
+        self.transition.actions = torch.where(intervention_mask, teacher_actions, student_actions)
+        self.transition.privileged_actions = teacher_actions
+        self._rollout_intervention_sum += intervention_mask.float().mean().item()
+        self._rollout_intervention_steps += 1
         # Record the observations
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
+
+    @property
+    def teacher_intervention_beta(self) -> float:
+        """Current probability that the teacher executes an environment step."""
+        progress = min(self.num_updates / self.teacher_intervention_decay_updates, 1.0)
+        return self.teacher_intervention_start + progress * (
+            self.teacher_intervention_end - self.teacher_intervention_start
+        )
+
+    def _compute_behavior_loss(
+        self, student_actions: torch.Tensor, teacher_actions: torch.Tensor
+    ) -> torch.Tensor:
+        element_loss = self.loss_fn(student_actions, teacher_actions, reduction="none")
+        if self.action_loss_weights is None:
+            return element_loss.mean()
+        return (
+            (element_loss * self.action_loss_weights).sum(dim=-1)
+            / self.action_loss_weights.sum()
+        ).mean()
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -133,8 +220,10 @@ class Distillation:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        rollout_beta = self.teacher_intervention_beta
         self.num_updates += 1
         mean_behavior_loss = 0
+        mean_latent_loss = 0 if self.latent_projection is not None else None
         accumulated_loss: torch.Tensor | None = None
         accumulated_batches = 0
         cnt = 0
@@ -144,20 +233,41 @@ class Distillation:
             self.teacher.reset(hidden_state=self.last_hidden_states[1])
             self.student.detach_hidden_state()
             for batch in self.storage.generator():
-                # Inference of the student for gradient computation
-                actions = self.student(batch.observations)
+                # Inference of the student for gradient computation. When
+                # enabled, reuse the same visual encoding for the action and
+                # representation objectives.
+                if self.latent_projection is not None:
+                    actions, visual_latent = self.student.forward_with_visual_latent(  # type: ignore
+                        batch.observations
+                    )
+                else:
+                    actions = self.student(batch.observations)
 
                 # Behavior cloning loss
-                behavior_loss = self.loss_fn(actions, batch.privileged_actions)
+                behavior_loss = self._compute_behavior_loss(actions, batch.privileged_actions)
+
+                latent_loss = None
+                if self.latent_projection is not None:
+                    if batch.privileged_latent is None:
+                        raise RuntimeError("Latent distillation target is missing from rollout storage.")
+                    predicted_latent = self.latent_projection(visual_latent)
+                    latent_loss = nn.functional.smooth_l1_loss(
+                        predicted_latent, batch.privileged_latent
+                    )
 
                 # Total loss
+                total_batch_loss = behavior_loss
+                if latent_loss is not None:
+                    total_batch_loss = total_batch_loss + self.latent_loss_coef * latent_loss
                 accumulated_loss = (
-                    behavior_loss
+                    total_batch_loss
                     if accumulated_loss is None
-                    else accumulated_loss + behavior_loss
+                    else accumulated_loss + total_batch_loss
                 )
                 accumulated_batches += 1
                 mean_behavior_loss += behavior_loss.item()
+                if mean_latent_loss is not None:
+                    mean_latent_loss += latent_loss.item()  # type: ignore[union-attr]
                 cnt += 1
 
                 # Gradient step
@@ -167,7 +277,7 @@ class Distillation:
                     if self.is_multi_gpu:
                         self.reduce_parameters()
                     if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
+                        nn.utils.clip_grad_norm_(self._trainable_parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.student.detach_hidden_state()
                     accumulated_loss = None
@@ -185,29 +295,55 @@ class Distillation:
             if self.is_multi_gpu:
                 self.reduce_parameters()
             if self.max_grad_norm:
-                nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self._trainable_parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.student.detach_hidden_state()
 
         mean_behavior_loss /= cnt
+        if mean_latent_loss is not None:
+            mean_latent_loss /= cnt
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
 
         # Construct the loss dictionary
-        loss_dict = {"behavior": mean_behavior_loss}
+        intervention_rate = (
+            self._rollout_intervention_sum / self._rollout_intervention_steps
+            if self._rollout_intervention_steps > 0
+            else 0.0
+        )
+        loss_dict = {
+            "behavior": mean_behavior_loss,
+            "teacher_intervention_beta": rollout_beta,
+            "teacher_intervention_rate": intervention_rate,
+        }
+        if mean_latent_loss is not None:
+            loss_dict["latent"] = mean_latent_loss
+        self._rollout_intervention_sum = 0.0
+        self._rollout_intervention_steps = 0
 
         return loss_dict
+
+    def _trainable_parameters(self) -> list[nn.Parameter]:
+        """Return student and auxiliary-head parameters for clipping/sync."""
+        parameters = list(self.student.parameters())
+        if self.latent_projection is not None:
+            parameters.extend(self.latent_projection.parameters())
+        return parameters
 
     def train_mode(self) -> None:
         """Set train mode for the student and keep the teacher in eval mode."""
         self.student.train()
+        if self.latent_projection is not None:
+            self.latent_projection.train()
         # Teacher is always in eval mode
         self.teacher.eval()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for student and teacher models."""
         self.student.eval()
+        if self.latent_projection is not None:
+            self.latent_projection.eval()
         self.teacher.eval()
 
     def save(self) -> dict:
@@ -217,6 +353,8 @@ class Distillation:
             "teacher_state_dict": self._raw_teacher.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self.latent_projection is not None:
+            saved_dict["latent_projection_state_dict"] = self.latent_projection.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -242,6 +380,8 @@ class Distillation:
             self.teacher_loaded = True
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        if self.latent_projection is not None and "latent_projection_state_dict" in loaded_dict:
+            self.latent_projection.load_state_dict(loaded_dict["latent_projection_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -290,7 +430,20 @@ class Distillation:
         print(f"Teacher Model: {teacher}")
 
         # Initialize the storage
-        storage = RolloutStorage("distillation", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        privileged_latent_dim = (
+            getattr(teacher, "privileged_latent_dim", None)
+            if cfg["algorithm"].get("latent_loss_coef", 0.0) > 0
+            else None
+        )
+        storage = RolloutStorage(
+            "distillation",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            device,
+            privileged_latent_dim=privileged_latent_dim,
+        )
 
         # Initialize the algorithm
         alg: Distillation = alg_class(
@@ -307,11 +460,15 @@ class Distillation:
         """Broadcast model parameters to all GPUs."""
         # Obtain the model parameters on current GPU
         model_params = [self._raw_student.state_dict(), self._raw_teacher.state_dict()]
+        if self.latent_projection is not None:
+            model_params.append(self.latent_projection.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
         self._raw_student.load_state_dict(model_params[0])
         self._raw_teacher.load_state_dict(model_params[1])
+        if self.latent_projection is not None:
+            self.latent_projection.load_state_dict(model_params[2])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -319,14 +476,15 @@ class Distillation:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.student.parameters() if param.grad is not None]
+        parameters = self._trainable_parameters()
+        grads = [param.grad.view(-1) for param in parameters if param.grad is not None]
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
-        for param in self.student.parameters():
+        for param in parameters:
             if param.grad is not None:
                 numel = param.numel()
                 # Copy data back from shared buffer

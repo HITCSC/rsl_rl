@@ -42,6 +42,7 @@ class PPO:
         actor: MLPModel,
         critic: MLPModel,
         storage: RolloutStorage,
+        teacher: MLPModel | None = None,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -56,6 +57,9 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
+        behavior_loss_coef_start: float = 0.0,
+        behavior_loss_coef_end: float = 0.0,
+        behavior_loss_decay_updates: int = 1,
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -117,6 +121,21 @@ class PPO:
         # simply alias ``self.actor`` / ``self.critic``.
         self._raw_actor = self.actor
         self._raw_critic = self.critic
+        self.teacher = teacher.to(self.device) if teacher is not None else None
+        if self.teacher is not None and (self.actor.is_recurrent or self.critic.is_recurrent):
+            raise ValueError("Teacher-regularized PPO currently supports feedforward policies only.")
+        if self.teacher is not None and self.symmetry is not None:
+            raise ValueError("Symmetry augmentation is not supported with teacher behavior regularization.")
+        if behavior_loss_coef_start < 0 or behavior_loss_coef_end < 0:
+            raise ValueError("Behavior loss coefficients must be non-negative.")
+        if behavior_loss_decay_updates <= 0:
+            raise ValueError("behavior_loss_decay_updates must be positive.")
+        if self.teacher is None and (behavior_loss_coef_start > 0 or behavior_loss_coef_end > 0):
+            raise ValueError("PPO behavior regularization requires a teacher model.")
+        self.behavior_loss_coef_start = float(behavior_loss_coef_start)
+        self.behavior_loss_coef_end = float(behavior_loss_coef_end)
+        self.behavior_loss_decay_updates = int(behavior_loss_decay_updates)
+        self.num_updates = 0
 
         # Create the optimizer
         optimizer_parameters = {
@@ -144,6 +163,14 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+    @property
+    def behavior_loss_coef(self) -> float:
+        """Current teacher-action regularization coefficient."""
+        progress = min(self.num_updates / self.behavior_loss_decay_updates, 1.0)
+        return self.behavior_loss_coef_start + progress * (
+            self.behavior_loss_coef_end - self.behavior_loss_coef_start
+        )
 
     def set_amp_reference_sampler(self, sampler) -> None:
         """Attach a reference-motion sampler to enable AMP discriminator training.
@@ -185,6 +212,8 @@ class PPO:
         self.transition.distribution_params = tuple(p.detach() for p in actor_model.output_distribution_params)
         # Record observations before env.step()
         self.transition.observations = obs
+        if self.teacher is not None:
+            self.transition.privileged_actions = self.teacher(obs).detach()
         return self.transition.actions  # type: ignore
 
     def process_env_step(
@@ -201,6 +230,8 @@ class PPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if self.teacher is not None:
+            self.teacher.reset(dones)
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -262,9 +293,12 @@ class PPO:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        behavior_coef = self.behavior_loss_coef
+        self.num_updates += 1
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_behavior_loss = 0 if self.teacher is not None else None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -372,6 +406,19 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
+            behavior_loss = None
+            if self.teacher is not None:
+                if batch.privileged_actions is None:
+                    raise RuntimeError("Teacher actions are missing from the hybrid PPO rollout.")
+                # The stochastic forward above has already updated the actor
+                # distribution. Regularize its deterministic mean, not the
+                # sampled action used by PPO.
+                behavior_loss = nn.functional.smooth_l1_loss(
+                    actor_model.output_mean[:original_batch_size],
+                    batch.privileged_actions[:original_batch_size],
+                )
+                loss = loss + behavior_coef * behavior_loss
+
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
@@ -427,6 +474,8 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            if mean_behavior_loss is not None:
+                mean_behavior_loss += behavior_loss.item()  # type: ignore[union-attr]
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -442,6 +491,8 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        if mean_behavior_loss is not None:
+            mean_behavior_loss /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -455,6 +506,9 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if mean_behavior_loss is not None:
+            loss_dict["behavior"] = mean_behavior_loss
+            loss_dict["behavior_coef"] = behavior_coef
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -471,6 +525,8 @@ class PPO:
         """Set train mode for learnable models."""
         self.actor.train()
         self.critic.train()
+        if self.teacher is not None:
+            self.teacher.eval()
         if self.rnd:
             self.rnd.train()
         if self.amp:
@@ -480,6 +536,8 @@ class PPO:
         """Set evaluation mode for learnable models."""
         self.actor.eval()
         self.critic.eval()
+        if self.teacher is not None:
+            self.teacher.eval()
         if self.rnd:
             self.rnd.eval()
         if self.amp:
@@ -495,23 +553,48 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.teacher is not None:
+            saved_dict["teacher_state_dict"] = self.teacher.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load specified models from a saved dict."""
-        # If no load_cfg is provided, load all models and states
-        if load_cfg is None:
+        is_distillation_checkpoint = (
+            "student_state_dict" in loaded_dict and "actor_state_dict" not in loaded_dict
+        )
+        # A distillation checkpoint initializes only the actor. The critic and
+        # PPO optimizer are intentionally fresh, and training starts at iter 0.
+        if load_cfg is None and is_distillation_checkpoint:
+            load_cfg = {
+                "actor": True,
+                "critic": False,
+                "optimizer": False,
+                "iteration": False,
+                "rnd": False,
+                "teacher": False,
+            }
+        elif load_cfg is None:
             load_cfg = {
                 "actor": True,
                 "critic": True,
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "teacher": True,
             }
 
         # Load the specified models
         if load_cfg.get("actor"):
-            self._raw_actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            actor_state_dict = loaded_dict.get("actor_state_dict") or loaded_dict["student_state_dict"]
+            if is_distillation_checkpoint and self._raw_actor.distribution is not None:
+                # BC rollouts are deterministic, so its distribution std is
+                # never trained. Preserve the PPO task's configured exploration
+                # state instead of importing the stale BC std.
+                distribution_state = self._raw_actor.distribution.state_dict()
+                self._raw_actor.load_state_dict(actor_state_dict, strict=strict)
+                self._raw_actor.distribution.load_state_dict(distribution_state)
+            else:
+                self._raw_actor.load_state_dict(actor_state_dict, strict=strict)
         if load_cfg.get("critic"):
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
@@ -519,6 +602,8 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if load_cfg.get("teacher") and self.teacher is not None and "teacher_state_dict" in loaded_dict:
+            self.teacher.load_state_dict(loaded_dict["teacher_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -546,6 +631,9 @@ class PPO:
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
+        teacher_cfg = cfg.get("teacher")
+        if teacher_cfg is not None:
+            default_sets.append("teacher")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
@@ -564,11 +652,37 @@ class PPO:
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
+        teacher = None
+        if teacher_cfg is not None:
+            teacher_cfg = dict(teacher_cfg)
+            teacher_class: type[MLPModel] = resolve_callable(teacher_cfg.pop("class_name"))  # type: ignore
+            teacher = teacher_class(
+                obs, cfg["obs_groups"], "teacher", env.num_actions, **teacher_cfg
+            ).to(device)
+            teacher.eval()
+            print(f"Teacher Model: {teacher}")
+
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage = RolloutStorage(
+            "rl",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            device,
+            store_privileged_actions=teacher is not None,
+        )
 
         # Initialize the algorithm
-        alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPO = alg_class(
+            actor,
+            critic,
+            storage,
+            teacher=teacher,
+            device=device,
+            **cfg["algorithm"],
+            multi_gpu_cfg=cfg["multi_gpu"],
+        )
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))

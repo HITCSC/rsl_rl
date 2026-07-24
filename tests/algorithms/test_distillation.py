@@ -147,3 +147,32 @@ class TestDistillationLoss:
         alg.optimizer.step = counting_step
         alg.update()
         assert step_count == 2
+
+    def test_teacher_intervention_schedule_executes_teacher_actions(self) -> None:
+        """A beta of one must execute complete teacher action vectors."""
+        alg, obs, _storage = _make_distillation_setup()
+        alg.teacher_intervention_start = 1.0
+        alg.teacher_intervention_end = 0.0
+        alg.teacher_intervention_decay_updates = 10
+
+        with torch.no_grad():
+            expected_teacher_actions = alg.teacher(obs)
+            actions = alg.act(obs)
+
+        assert torch.equal(actions, expected_teacher_actions)
+        assert alg.transition.privileged_actions is not None
+        assert torch.equal(alg.transition.privileged_actions, expected_teacher_actions)
+        assert alg.teacher_intervention_beta == 1.0
+
+    def test_action_loss_weights_change_behavior_objective(self) -> None:
+        """Per-action weights should prioritize selected joints without changing scale."""
+        alg, _obs, _storage = _make_distillation_setup()
+        student_actions = torch.zeros(2, NUM_ACTIONS)
+        teacher_actions = torch.zeros_like(student_actions)
+        teacher_actions[:, 0] = 2.0
+
+        unweighted = alg._compute_behavior_loss(student_actions, teacher_actions)
+        alg.action_loss_weights = torch.tensor([4.0, 1.0, 1.0, 1.0])
+        weighted = alg._compute_behavior_loss(student_actions, teacher_actions)
+
+        assert weighted > unweighted

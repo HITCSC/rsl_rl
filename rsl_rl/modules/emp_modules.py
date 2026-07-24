@@ -285,10 +285,21 @@ class ActorCriticCNN(nn.Module):
         """
         # Split: first 423 dims → normalizer; last 63 dims → CNN.
         norm_obs = self.actor_obs_normalizer(teacher_input[:, :423])  # [B, 423]
-        # Unsqueeze temporal dim → [B, 63, 1] for PolicyHeightMapCNN.
-        cnn_feat = self.height_map_cnn(teacher_input[:, 423:].unsqueeze(-1)).squeeze(1)  # [B, 64]
+        cnn_feat = self.encode_height(teacher_input[:, 423:])
         final_input = torch.cat([norm_obs, cnn_feat], dim=-1)  # [B, 487]
         return self.actor(final_input)  # [B, num_actions]
+
+    def encode_height(self, height_scan: torch.Tensor) -> torch.Tensor:
+        """Encode the 63-D privileged terrain scan into the teacher latent."""
+        # Unsqueeze temporal dim → [B, 63, 1] for PolicyHeightMapCNN.
+        return self.height_map_cnn(height_scan.unsqueeze(-1)).squeeze(1)  # [B, 64]
+
+    def forward_with_latent(self, teacher_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return teacher actions and the terrain representation that produced them."""
+        norm_obs = self.actor_obs_normalizer(teacher_input[:, :423])
+        cnn_feat = self.encode_height(teacher_input[:, 423:])
+        actions = self.actor(torch.cat([norm_obs, cnn_feat], dim=-1))
+        return actions, cnn_feat
 
 
 def build_teacher(checkpoint_path: str, device: str = "cpu") -> ActorCriticCNN:
