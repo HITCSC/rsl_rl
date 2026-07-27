@@ -11,6 +11,7 @@ from .emp_teacher_model import EMPTeacherModel
 from .mlp_model import MLPModel
 from .moe_model import MoEModel
 from .rnn_model import RNNModel
+from .ssr_model import SSRModel
 
 __all__ = [
     "CNNModel",
@@ -19,4 +20,5 @@ __all__ = [
     "MLPModel",
     "MoEModel",
     "RNNModel",
+    "SSRModel",
 ]

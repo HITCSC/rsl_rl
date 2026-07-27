@@ -7,10 +7,9 @@
 from __future__ import annotations
 
 import copy
-from itertools import chain
-
 import torch
 import torch.nn as nn
+from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -271,6 +270,18 @@ class PPO:
         if self.teacher is not None:
             self.teacher.reset(dones)
 
+        # SSR's next-proprioception decoder is supervised with the observation
+        # produced by this environment step. Store only the newest frame; the
+        # policy input itself contains the full fixed history.
+        if hasattr(self._raw_actor, "auxiliary_losses"):
+            group = self._raw_actor.proprio_group  # type: ignore[attr-defined]
+            frame_dim = self._raw_actor.frame_dim  # type: ignore[attr-defined]
+            extra = self.transition.extra
+            if extra is None:
+                extra = TensorDict({}, batch_size=obs.batch_size, device=obs.device)
+            extra["ssr_next_proprio"] = obs[group][..., -frame_dim:].detach()
+            self.transition.extra = extra
+
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
             # Compute the intrinsic rewards
@@ -344,6 +355,7 @@ class PPO:
         # AMP discriminator loss (scaffold; only trains when a reference sampler
         # is attached — see doc/amp_scaffold.md).
         mean_amp_loss = 0 if (self.amp is not None and self._amp_reference_sampler is not None) else None
+        mean_auxiliary_losses: dict[str, float] = {}
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -444,6 +456,16 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
+            auxiliary_losses = None
+            if hasattr(self._raw_actor, "auxiliary_losses"):
+                auxiliary_losses = self._raw_actor.auxiliary_losses(  # type: ignore[attr-defined]
+                    batch.observations[:original_batch_size], batch.extra
+                )
+                for name, (auxiliary_loss, coefficient) in auxiliary_losses.items():
+                    loss = loss + coefficient * auxiliary_loss
+                    mean_auxiliary_losses.setdefault(name, 0.0)
+                    mean_auxiliary_losses[name] += auxiliary_loss.item()
+
             behavior_loss = None
             if self.teacher is not None:
                 if batch.privileged_actions is None:
@@ -537,6 +559,8 @@ class PPO:
             mean_symmetry_loss /= num_updates
         if mean_amp_loss is not None:
             mean_amp_loss /= num_updates
+        for name in mean_auxiliary_losses:
+            mean_auxiliary_losses[name] /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -553,6 +577,7 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if mean_amp_loss is not None:
             loss_dict["amp_discriminator"] = mean_amp_loss
+        loss_dict.update(mean_auxiliary_losses)
 
         # Clear the storage
         self.storage.clear()
@@ -726,6 +751,14 @@ class PPO:
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
         )
+
+        # ``resolve_symmetry_config`` injects the live environment so the
+        # extension can interpret manager observations. Do not leave that
+        # non-serializable object in the user configuration: train.py dumps the
+        # resolved agent config after runner construction.
+        symmetry_cfg = cfg["algorithm"].get("symmetry_cfg")
+        if symmetry_cfg is not None:
+            symmetry_cfg.pop("env", None)
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
