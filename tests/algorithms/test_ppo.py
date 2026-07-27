@@ -45,6 +45,8 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
     critic = _make_critic(obs, obs_groups)
+    with_teacher = bool(overrides.pop("with_teacher", False))
+    teacher = _make_actor(obs, obs_groups, NUM_ACTIONS) if with_teacher else None
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
 
     defaults = dict(
@@ -61,7 +63,7 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
         desired_kl=0.01,
     )
     defaults.update(overrides)
-    ppo = PPO(actor, critic, storage, **defaults)
+    ppo = PPO(actor, critic, storage, teacher=teacher, **defaults)
     return ppo, obs
 
 
@@ -318,3 +320,65 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+class TestBehaviorRegularization:
+    """Tests for teacher-regularized PPO scheduling and checkpoint loading."""
+
+    def test_behavior_schedule_holds_before_decay(self) -> None:
+        ppo, _obs = _build_ppo(
+            with_teacher=True,
+            behavior_loss_coef_start=0.3,
+            behavior_loss_coef_end=0.05,
+            behavior_loss_hold_updates=100,
+            behavior_loss_decay_updates=200,
+        )
+
+        ppo.num_updates = 100
+        assert abs(ppo.behavior_loss_coef - 0.3) < 1e-12
+        ppo.num_updates = 200
+        assert abs(ppo.behavior_loss_coef - 0.175) < 1e-12
+        ppo.num_updates = 300
+        assert abs(ppo.behavior_loss_coef - 0.05) < 1e-12
+
+    def test_action_weights_prioritize_selected_actions(self) -> None:
+        ppo, _obs = _build_ppo(behavior_action_weights=[4.0, 1.0, 1.0, 1.0])
+        actor_actions = torch.zeros(2, NUM_ACTIONS)
+        teacher_actions = torch.zeros_like(actor_actions)
+        teacher_actions[:, 0] = 2.0
+
+        weighted = ppo._compute_behavior_loss(actor_actions, teacher_actions)
+        ppo.behavior_action_weights = None
+        unweighted = ppo._compute_behavior_loss(actor_actions, teacher_actions)
+
+        assert weighted > unweighted
+
+    def test_distillation_load_preserves_configured_std(self) -> None:
+        ppo, _obs = _build_ppo()
+        assert ppo.actor.distribution is not None
+        ppo.actor.distribution.std_param.data.fill_(0.15)
+        student_state = {
+            key: value.detach().clone() for key, value in ppo.actor.state_dict().items()
+        }
+        student_state["distribution.std_param"].fill_(0.5)
+
+        load_iteration = ppo.load(
+            {"student_state_dict": student_state}, load_cfg=None, strict=True
+        )
+
+        assert not load_iteration
+        assert torch.allclose(
+            ppo.actor.distribution.std_param, torch.full_like(ppo.actor.distribution.std_param, 0.15)
+        )
+
+    def test_ppo_resume_restores_behavior_schedule_progress(self) -> None:
+        source, _obs = _build_ppo()
+        source.num_updates = 4321
+        checkpoint = source.save()
+        checkpoint["iter"] = 4320
+
+        target, _obs = _build_ppo()
+        load_iteration = target.load(checkpoint, load_cfg=None, strict=True)
+
+        assert load_iteration
+        assert target.num_updates == 4321

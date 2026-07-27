@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import copy
+from itertools import chain
+
 import torch
 import torch.nn as nn
-from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -60,6 +62,9 @@ class PPO:
         behavior_loss_coef_start: float = 0.0,
         behavior_loss_coef_end: float = 0.0,
         behavior_loss_decay_updates: int = 1,
+        behavior_loss_hold_updates: int = 0,
+        behavior_loss_type: str = "huber",
+        behavior_action_weights: tuple[float, ...] | list[float] | None = None,
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -130,11 +135,28 @@ class PPO:
             raise ValueError("Behavior loss coefficients must be non-negative.")
         if behavior_loss_decay_updates <= 0:
             raise ValueError("behavior_loss_decay_updates must be positive.")
+        if behavior_loss_hold_updates < 0:
+            raise ValueError("behavior_loss_hold_updates must be non-negative.")
         if self.teacher is None and (behavior_loss_coef_start > 0 or behavior_loss_coef_end > 0):
             raise ValueError("PPO behavior regularization requires a teacher model.")
+        if behavior_loss_type not in {"huber", "mse"}:
+            raise ValueError("behavior_loss_type must be either 'huber' or 'mse'.")
         self.behavior_loss_coef_start = float(behavior_loss_coef_start)
         self.behavior_loss_coef_end = float(behavior_loss_coef_end)
         self.behavior_loss_decay_updates = int(behavior_loss_decay_updates)
+        self.behavior_loss_hold_updates = int(behavior_loss_hold_updates)
+        self.behavior_loss_type = behavior_loss_type
+        self.behavior_action_weights = None
+        if behavior_action_weights is not None:
+            weights = torch.as_tensor(behavior_action_weights, device=self.device, dtype=torch.float)
+            if weights.ndim != 1 or weights.numel() != storage.actions_shape[-1]:
+                raise ValueError(
+                    "behavior_action_weights must contain one value per action "
+                    f"({storage.actions_shape[-1]} expected, got {weights.numel()})."
+                )
+            if torch.any(weights <= 0):
+                raise ValueError("behavior_action_weights must be positive.")
+            self.behavior_action_weights = weights
         self.num_updates = 0
 
         # Create the optimizer
@@ -167,10 +189,26 @@ class PPO:
     @property
     def behavior_loss_coef(self) -> float:
         """Current teacher-action regularization coefficient."""
-        progress = min(self.num_updates / self.behavior_loss_decay_updates, 1.0)
+        decay_update = max(self.num_updates - self.behavior_loss_hold_updates, 0)
+        progress = min(decay_update / self.behavior_loss_decay_updates, 1.0)
         return self.behavior_loss_coef_start + progress * (
             self.behavior_loss_coef_end - self.behavior_loss_coef_start
         )
+
+    def _compute_behavior_loss(
+        self, actor_actions: torch.Tensor, teacher_actions: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute action-wise teacher regularization with stable overall scale."""
+        if self.behavior_loss_type == "mse":
+            element_loss = nn.functional.mse_loss(actor_actions, teacher_actions, reduction="none")
+        else:
+            element_loss = nn.functional.smooth_l1_loss(
+                actor_actions, teacher_actions, reduction="none"
+            )
+        if self.behavior_action_weights is not None:
+            normalized_weights = self.behavior_action_weights / self.behavior_action_weights.mean()
+            element_loss = element_loss * normalized_weights
+        return element_loss.mean()
 
     def set_amp_reference_sampler(self, sampler) -> None:
         """Attach a reference-motion sampler to enable AMP discriminator training.
@@ -413,7 +451,7 @@ class PPO:
                 # The stochastic forward above has already updated the actor
                 # distribution. Regularize its deterministic mean, not the
                 # sampled action used by PPO.
-                behavior_loss = nn.functional.smooth_l1_loss(
+                behavior_loss = self._compute_behavior_loss(
                     actor_model.output_mean[:original_batch_size],
                     batch.privileged_actions[:original_batch_size],
                 )
@@ -555,6 +593,7 @@ class PPO:
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
         if self.teacher is not None:
             saved_dict["teacher_state_dict"] = self.teacher.state_dict()
+        saved_dict["algorithm_num_updates"] = self.num_updates
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -590,7 +629,7 @@ class PPO:
                 # BC rollouts are deterministic, so its distribution std is
                 # never trained. Preserve the PPO task's configured exploration
                 # state instead of importing the stale BC std.
-                distribution_state = self._raw_actor.distribution.state_dict()
+                distribution_state = copy.deepcopy(self._raw_actor.distribution.state_dict())
                 self._raw_actor.load_state_dict(actor_state_dict, strict=strict)
                 self._raw_actor.distribution.load_state_dict(distribution_state)
             else:
@@ -604,6 +643,10 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("teacher") and self.teacher is not None and "teacher_state_dict" in loaded_dict:
             self.teacher.load_state_dict(loaded_dict["teacher_state_dict"], strict=strict)
+        if load_cfg.get("iteration"):
+            self.num_updates = int(
+                loaded_dict.get("algorithm_num_updates", loaded_dict.get("iter", -1) + 1)
+            )
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
