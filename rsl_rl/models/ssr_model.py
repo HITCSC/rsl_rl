@@ -53,7 +53,7 @@ class SSRModel(MLPModel):
     """Kuavo-compatible implementation of the SSR actor architecture.
 
     A five-frame proprioceptive sequence is encoded frame-wise and reduced by
-    a GRU. Current 36x36 depth is encoded by the paper's three-layer CNN. A
+    a GRU. Current 42x42 depth is encoded by the paper's three-layer CNN. A
     fusion MLP feeds three 16-D latent heads, while a separate estimator
     predicts base velocity. Current proprioception, estimated velocity and the
     48-D latent are consumed by a five-expert MoE actor.
@@ -93,9 +93,9 @@ class SSRModel(MLPModel):
                 f"Proprioception width {proprio_dim} is not divisible by history_length={self.history_length}."
             )
         self.frame_dim = proprio_dim // self.history_length
-        if tuple(obs[self.depth_group].shape[-3:]) != (1, 36, 36):
+        if tuple(obs[self.depth_group].shape[-3:]) != (1, 42, 42):
             raise ValueError(
-                f"SSRModel expects depth [B,1,36,36], got {tuple(obs[self.depth_group].shape)}."
+                f"SSRModel expects depth [B,1,42,42], got {tuple(obs[self.depth_group].shape)}."
             )
         self.obs_dim = proprio_dim
         self.obs_normalization = obs_normalization
