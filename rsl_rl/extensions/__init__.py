@@ -6,13 +6,16 @@
 """Extensions for the learning algorithms."""
 
 from .amp import AMPDiscriminator
+from .foothold import ImaginedFoothold, resolve_foothold_config
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
 
 __all__ = [
     "AMPDiscriminator",
+    "ImaginedFoothold",
     "RandomNetworkDistillation",
     "Symmetry",
     "resolve_rnd_config",
+    "resolve_foothold_config",
     "resolve_symmetry_config",
 ]

@@ -15,8 +15,10 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import (
     AMPDiscriminator,
+    ImaginedFoothold,
     RandomNetworkDistillation,
     Symmetry,
+    resolve_foothold_config,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
@@ -71,6 +73,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # AMP parameters (scaffold; default-off — see rsl_rl/extensions/amp.py)
         amp_cfg: dict | None = None,
+        # SSR imagined-foothold predictor and guidance reward.
+        foothold_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -108,6 +112,13 @@ class PPO:
             amp_cfg = dict(amp_cfg)
             self.amp_reward_coef = float(amp_cfg.pop("reward_coef", 1.0))
             self.amp = AMPDiscriminator(device=self.device, **amp_cfg)
+
+        self.foothold = ImaginedFoothold(device=self.device, **foothold_cfg) if foothold_cfg else None
+        self._rollout_excluded_obs_groups = (
+            (self.foothold.terrain_group, self.foothold.geometry_group)
+            if self.foothold is not None
+            else ()
+        )
 
         # PPO components
         self.actor = actor.to(self.device)
@@ -248,9 +259,15 @@ class PPO:
         ).detach()
         self.transition.distribution_params = tuple(p.detach() for p in actor_model.output_distribution_params)
         # Record observations before env.step()
-        self.transition.observations = obs
+        self.transition.observations = (
+            obs.exclude(*self._rollout_excluded_obs_groups)
+            if self._rollout_excluded_obs_groups
+            else obs
+        )
         if self.teacher is not None:
             self.transition.privileged_actions = self.teacher(obs).detach()
+        if self.foothold is not None:
+            self.foothold.observe_action(obs, self.transition.actions)
         return self.transition.actions  # type: ignore
 
     def process_env_step(
@@ -267,6 +284,11 @@ class PPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if self.foothold is not None:
+            self.transition.rewards += self.foothold.last_reward
+            self.foothold.process_step(obs, dones)
+            if "log" in extras:
+                extras["log"]["Foothold/reward"] = self.foothold.last_reward.mean()
         if self.teacher is not None:
             self.teacher.reset(dones)
 
@@ -578,6 +600,13 @@ class PPO:
         if mean_amp_loss is not None:
             loss_dict["amp_discriminator"] = mean_amp_loss
         loss_dict.update(mean_auxiliary_losses)
+        if self.foothold is not None:
+            loss_dict.update(
+                self.foothold.update(
+                    is_multi_gpu=self.is_multi_gpu,
+                    world_size=self.gpu_world_size,
+                )
+            )
 
         # Clear the storage
         self.storage.clear()
@@ -594,6 +623,8 @@ class PPO:
             self.rnd.train()
         if self.amp:
             self.amp.train()
+        if self.foothold:
+            self.foothold.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -605,6 +636,8 @@ class PPO:
             self.rnd.eval()
         if self.amp:
             self.amp.eval()
+        if self.foothold:
+            self.foothold.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -618,6 +651,9 @@ class PPO:
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
         if self.teacher is not None:
             saved_dict["teacher_state_dict"] = self.teacher.state_dict()
+        if self.foothold is not None:
+            saved_dict["foothold_state_dict"] = self.foothold.state_dict()
+            saved_dict["foothold_optimizer_state_dict"] = self.foothold.optimizer.state_dict()
         saved_dict["algorithm_num_updates"] = self.num_updates
         return saved_dict
 
@@ -636,6 +672,7 @@ class PPO:
                 "iteration": False,
                 "rnd": False,
                 "teacher": False,
+                "foothold": False,
             }
         elif load_cfg is None:
             load_cfg = {
@@ -645,6 +682,7 @@ class PPO:
                 "iteration": True,
                 "rnd": True,
                 "teacher": True,
+                "foothold": True,
             }
 
         # Load the specified models
@@ -668,6 +706,10 @@ class PPO:
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if load_cfg.get("teacher") and self.teacher is not None and "teacher_state_dict" in loaded_dict:
             self.teacher.load_state_dict(loaded_dict["teacher_state_dict"], strict=strict)
+        if load_cfg.get("foothold") and self.foothold is not None and "foothold_state_dict" in loaded_dict:
+            self.foothold.load_state_dict(loaded_dict["foothold_state_dict"], strict=strict)
+            if "foothold_optimizer_state_dict" in loaded_dict:
+                self.foothold.optimizer.load_state_dict(loaded_dict["foothold_optimizer_state_dict"])
         if load_cfg.get("iteration"):
             self.num_updates = int(
                 loaded_dict.get("algorithm_num_updates", loaded_dict.get("iter", -1) + 1)
@@ -709,6 +751,10 @@ class PPO:
         # Resolve RND config if used
         cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
 
+        cfg["algorithm"] = resolve_foothold_config(
+            cfg["algorithm"], obs, env.num_actions, env.num_envs, env.unwrapped.step_dt
+        )
+
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
@@ -731,11 +777,17 @@ class PPO:
             print(f"Teacher Model: {teacher}")
 
         # Initialize the storage
+        foothold_cfg = cfg["algorithm"].get("foothold_cfg")
+        storage_obs = (
+            obs.exclude(foothold_cfg["terrain_group"], foothold_cfg["geometry_group"])
+            if foothold_cfg is not None
+            else obs
+        )
         storage = RolloutStorage(
             "rl",
             env.num_envs,
             cfg["num_steps_per_env"],
-            obs,
+            storage_obs,
             [env.num_actions],
             device,
             store_privileged_actions=teacher is not None,
@@ -771,6 +823,8 @@ class PPO:
         model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        if self.foothold:
+            model_params.append(self.foothold.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
@@ -778,6 +832,8 @@ class PPO:
         self._raw_critic.load_state_dict(model_params[1])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
+        if self.foothold:
+            self.foothold.load_state_dict(model_params[-1])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
