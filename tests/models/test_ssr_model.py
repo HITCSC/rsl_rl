@@ -17,7 +17,7 @@ def _make_model() -> tuple[SSRModel, TensorDict]:
     obs = TensorDict(
         {
             "actor": torch.randn(2, 450),
-            "actor_depth": torch.randn(2, 1, 36, 36),
+            "actor_depth": torch.randn(2, 1, 42, 42),
             "ssr_foot_heights": torch.randn(2, 110),
             "ssr_body_heights": torch.randn(2, 81),
             "ssr_base_velocity": torch.randn(2, 3),
@@ -45,6 +45,7 @@ def test_ssr_structure_and_output_shape() -> None:
     assert output.shape == (2, 27)
     assert len(model.mlp.experts) == 5
     assert model.temporal_encoder.hidden_size == 256
+    assert model.temporal_encoder.input_size == 256
     assert model.foot_latent_head.out_features == 16
     assert model.body_latent_head.out_features == 16
     assert model.motion_mu_head.out_features == 16

@@ -52,11 +52,13 @@ class _SSRMoEActor(nn.Module):
 class SSRModel(MLPModel):
     """Kuavo-compatible implementation of the SSR actor architecture.
 
-    A five-frame proprioceptive sequence is encoded frame-wise and reduced by
-    a GRU. Current 42x42 depth is encoded by the paper's three-layer CNN. A
-    fusion MLP feeds three 16-D latent heads, while a separate estimator
-    predicts base velocity. Current proprioception, estimated velocity and the
-    48-D latent are consumed by a five-expert MoE actor.
+    A five-frame proprioceptive sequence is encoded frame-wise. The current
+    42x42 depth image is encoded by the paper's three-layer CNN, broadcast
+    across the history window, concatenated with each proprioceptive step, and
+    then processed by a GRU. The final hidden state feeds a fusion MLP and
+    three 16-D latent heads, while a separate estimator predicts base
+    velocity. Current proprioception, estimated velocity and the 48-D latent
+    are consumed by a five-expert MoE actor.
     """
 
     def __init__(
@@ -105,8 +107,8 @@ class SSRModel(MLPModel):
 
         self.proprio_encoder = MLP(self.frame_dim, 128, (512, 256, 128), activation)
         self.depth_encoder = _SSRDepthEncoder(activation)
-        self.temporal_encoder = nn.GRU(128, 256, num_layers=1, batch_first=True)
-        self.fusion_encoder = MLP(384, 48, (512, 256, 128), activation)
+        self.temporal_encoder = nn.GRU(256, 256, num_layers=1, batch_first=True)
+        self.fusion_encoder = MLP(256, 48, (512, 256, 128), activation)
         self.foot_latent_head = nn.Linear(48, 16)
         self.body_latent_head = nn.Linear(48, 16)
         self.motion_mu_head = nn.Linear(48, 16)
@@ -145,10 +147,10 @@ class SSRModel(MLPModel):
         proprio = self.obs_normalizer(obs[self.proprio_group])
         sequence = proprio.reshape(*proprio.shape[:-1], self.history_length, self.frame_dim)
         encoded_prop = self.proprio_encoder(sequence)
-        temporal, _ = self.temporal_encoder(encoded_prop)
-        temporal = temporal[..., -1, :]
         depth = self.depth_encoder(obs[self.depth_group])
-        fusion = self.fusion_encoder(torch.cat((temporal, depth), dim=-1))
+        depth = depth.unsqueeze(-2).expand(*encoded_prop.shape[:-1], depth.shape[-1])
+        temporal, _ = self.temporal_encoder(torch.cat((encoded_prop, depth), dim=-1))
+        fusion = self.fusion_encoder(temporal[..., -1, :])
         z_foot = self.foot_latent_head(fusion)
         z_body = self.body_latent_head(fusion)
         motion_mu = self.motion_mu_head(fusion)
@@ -258,10 +260,11 @@ class _TorchSSRModel(nn.Module):
     def forward(self, proprio: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         proprio = self.obs_normalizer(proprio)
         sequence = proprio.reshape(-1, self.history_length, self.frame_dim)
-        temporal, _ = self.temporal_encoder(self.proprio_encoder(sequence))
-        fusion = self.fusion_encoder(
-            torch.cat((temporal[:, -1], self.depth_encoder(depth)), dim=-1)
-        )
+        encoded_prop = self.proprio_encoder(sequence)
+        depth_feat = self.depth_encoder(depth)
+        depth_feat = depth_feat.unsqueeze(1).expand(-1, self.history_length, -1)
+        temporal, _ = self.temporal_encoder(torch.cat((encoded_prop, depth_feat), dim=-1))
+        fusion = self.fusion_encoder(temporal[:, -1])
         latent = torch.cat(
             (
                 self.foot_latent_head(fusion),
@@ -281,7 +284,7 @@ class _TorchSSRModel(nn.Module):
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             torch.zeros(1, self.proprio_dim),
-            torch.zeros(1, 1, 36, 36),
+            torch.zeros(1, 1, 42, 42),
         )
 
     @property
