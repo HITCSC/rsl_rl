@@ -240,6 +240,13 @@ class SSRModel(MLPModel):
 
 
 class _TorchSSRModel(nn.Module):
+    """Deployment wrapper using the S45-Rough ONNX input contract.
+
+    ``obs`` is frame-major with frames ordered oldest to newest. Each frame
+    keeps the policy's proprioceptive order: angular velocity, projected
+    gravity, command, joint position, joint velocity, then previous action.
+    """
+
     def __init__(self, model: SSRModel) -> None:
         super().__init__()
         self.history_length = model.history_length
@@ -257,11 +264,11 @@ class _TorchSSRModel(nn.Module):
         self.moe = copy.deepcopy(model.mlp)
         self.deterministic_output = model.distribution.as_deterministic_output_module()
 
-    def forward(self, proprio: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
-        proprio = self.obs_normalizer(proprio)
+    def forward(self, obs: torch.Tensor, actor_depth: torch.Tensor) -> torch.Tensor:
+        proprio = self.obs_normalizer(obs)
         sequence = proprio.reshape(-1, self.history_length, self.frame_dim)
         encoded_prop = self.proprio_encoder(sequence)
-        depth_feat = self.depth_encoder(depth)
+        depth_feat = self.depth_encoder(actor_depth)
         depth_feat = depth_feat.unsqueeze(1).expand(-1, self.history_length, -1)
         temporal, _ = self.temporal_encoder(torch.cat((encoded_prop, depth_feat), dim=-1))
         fusion = self.fusion_encoder(temporal[:, -1])
@@ -289,7 +296,7 @@ class _TorchSSRModel(nn.Module):
 
     @property
     def input_names(self) -> list[str]:
-        return ["proprioception", "depth"]
+        return ["obs", "actor_depth"]
 
     @property
     def output_names(self) -> list[str]:

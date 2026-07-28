@@ -69,9 +69,29 @@ def test_ssr_auxiliary_losses_backpropagate() -> None:
 
 
 def test_ssr_export_wrapper_shape() -> None:
-    """The deployment wrapper should expose proprioception and depth inputs."""
+    """The deployment wrapper should use the S45-Rough ONNX port names."""
     model, _ = _make_model()
     exported = model.as_onnx()
     proprio, depth = exported.get_dummy_inputs()
     assert exported(proprio, depth).shape == (1, 27)
-    assert exported.input_names == ["proprioception", "depth"]
+    assert exported.input_names == ["obs", "actor_depth"]
+    assert exported.output_names == ["actions"]
+
+
+def test_ssr_export_wrapper_preserves_oldest_to_newest_frame_order() -> None:
+    """Deployment props should reach the temporal encoder oldest to newest."""
+    model, _ = _make_model()
+    exported = model.as_onnx()
+    exported.obs_normalizer = torch.nn.Identity()
+    captured: list[torch.Tensor] = []
+
+    def capture_sequence(_module, inputs) -> None:
+        captured.append(inputs[0].detach().clone())
+
+    hook = exported.proprio_encoder.register_forward_pre_hook(capture_sequence)
+    frames = torch.arange(5, dtype=torch.float32).view(1, 5, 1).expand(-1, -1, 90)
+    exported(frames.reshape(1, -1), torch.zeros(1, 1, 42, 42))
+    hook.remove()
+
+    assert captured[0].shape == (1, 5, 90)
+    assert torch.equal(captured[0][0, :, 0], torch.arange(5, dtype=torch.float32))
