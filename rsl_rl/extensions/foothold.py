@@ -104,6 +104,7 @@ class ImaginedFoothold(nn.Module):
         reward_weight: float = 0.25,
         reward_variance: float = 0.0625,
         height_threshold: float = 0.03,
+        stable_contact_max_deficiency: float = 0.25,
         min_std: float = 0.02,
         max_std: float = 0.25,
         max_target_distance: float = 1.5,
@@ -126,6 +127,7 @@ class ImaginedFoothold(nn.Module):
         self.reward_weight = float(reward_weight) * float(step_dt)
         self.reward_variance = float(reward_variance)
         self.height_threshold = float(height_threshold)
+        self.stable_contact_max_deficiency = float(stable_contact_max_deficiency)
         self.min_std = float(min_std)
         self.max_std = float(max_std)
         self.max_target_distance = float(max_target_distance)
@@ -241,6 +243,21 @@ class ImaginedFoothold(nn.Module):
         )
         return 1.0 - supported.float().mean(dim=-1)
 
+    @staticmethod
+    def _feet_local(geometry: torch.Tensor) -> torch.Tensor:
+        root_xy = geometry[:, 0:2]
+        cos_yaw = geometry[:, 2:3]
+        sin_yaw = geometry[:, 3:4]
+        feet_w = geometry[:, 4:8].reshape(-1, 2, 2)
+        delta = feet_w - root_xy.unsqueeze(1)
+        return torch.stack(
+            (
+                cos_yaw * delta[..., 0] + sin_yaw * delta[..., 1],
+                -sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1],
+            ),
+            dim=-1,
+        )
+
     def observe_action(self, obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """Predict guidance for ``(s_t,a_t)`` and enqueue its delayed label."""
         states = self._state(obs)
@@ -252,26 +269,16 @@ class ImaginedFoothold(nn.Module):
 
             # Geometry root yaw is represented as cos/sin. Convert current sole
             # centers to the same root-yaw frame used by predictor outputs.
-            root_xy = geometry[:, 0:2]
-            cos_yaw = geometry[:, 2:3]
-            sin_yaw = geometry[:, 3:4]
-            feet_w = geometry[:, 4:8].reshape(-1, 2, 2)
-            delta = feet_w - root_xy.unsqueeze(1)
-            feet_local = torch.stack(
-                (
-                    cos_yaw * delta[..., 0] + sin_yaw * delta[..., 1],
-                    -sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1],
-                ),
-                dim=-1,
-            )
+            feet_local = self._feet_local(geometry)
             contacts = geometry[:, 8:10] > 0.5
 
             stance_rho = self._support_deficiency(terrain, feet_local.unsqueeze(2)).squeeze(2)
+            stable_contacts = contacts & (stance_rho <= self.stable_contact_max_deficiency)
             imagined_centers = mu.unsqueeze(2) + std[..., None, None] * self.sigma_directions.view(
                 1, 1, -1, 2
             )
             swing_rho = self._support_deficiency(terrain, imagined_centers).mean(dim=2)
-            deficiency = torch.where(contacts, stance_rho, swing_rho)
+            deficiency = torch.where(stable_contacts, stance_rho, swing_rho)
             reward = torch.exp(-deficiency.sum(dim=1).square() / self.reward_variance)
             active = (
                 (geometry[:, 12] >= self.reward_min_terrain_level)
@@ -284,7 +291,7 @@ class ImaginedFoothold(nn.Module):
             self._pending_states[cursor].copy_(states.detach().cpu())
             self._pending_actions[cursor].copy_(actions.detach().cpu())
             self._pending_roots[cursor].copy_(geometry[:, :4].detach().cpu())
-            self._pending_valid[cursor].copy_((~contacts).detach().cpu())
+            self._pending_valid[cursor].copy_((~stable_contacts).detach().cpu())
             self._pending_cursor = (cursor + 1) % self.max_pending_steps
         return self._last_reward
 
@@ -294,15 +301,23 @@ class ImaginedFoothold(nn.Module):
         return self._last_reward
 
     def process_step(self, obs: TensorDict, dones: torch.Tensor) -> None:
-        """Resolve pending swing samples when the next valid touchdown arrives."""
-        geometry = obs[self.geometry_group].detach().cpu()
-        first_contacts = geometry[:, 10:12] > 0.5
+        """Resolve pending swing samples when the next stable touchdown arrives."""
+        with torch.no_grad():
+            geometry_device = obs[self.geometry_group]
+            terrain = obs[self.terrain_group]
+            feet_local = self._feet_local(geometry_device)
+            contacts = geometry_device[:, 8:10] > 0.5
+            stance_rho = self._support_deficiency(terrain, feet_local.unsqueeze(2)).squeeze(2)
+            stable_contacts = contacts & (stance_rho <= self.stable_contact_max_deficiency)
+
         done_cpu = dones.detach().view(-1).bool().cpu()
-        first_contacts[done_cpu] = False
+        stable_contacts = stable_contacts.detach().cpu()
+        stable_contacts[done_cpu] = False
+        geometry = geometry_device.detach().cpu()
         feet_w = geometry[:, 4:8].reshape(-1, 2, 2)
 
         for foot in range(2):
-            landed = first_contacts[:, foot]
+            landed = stable_contacts[:, foot]
             if not torch.any(landed):
                 continue
             mask = self._pending_valid[:, :, foot] & landed.unsqueeze(0)

@@ -16,6 +16,7 @@ from rsl_rl.extensions import ImaginedFoothold
 def _observations(
     contacts: tuple[float, float],
     first_contacts: tuple[float, float],
+    valid: torch.Tensor | None = None,
 ) -> TensorDict:
     geometry = torch.tensor(
         [[
@@ -33,7 +34,9 @@ def _observations(
         ]]
     )
     # 3x3 constant-height map followed by nine valid flags.
-    terrain = torch.cat((torch.zeros(1, 9), torch.ones(1, 9)), dim=-1)
+    if valid is None:
+        valid = torch.ones(1, 9)
+    terrain = torch.cat((torch.zeros(1, 9), valid), dim=-1)
     return TensorDict(
         {"state": torch.zeros(1, 3), "terrain": terrain, "geometry": geometry},
         batch_size=[1],
@@ -80,3 +83,43 @@ def test_delayed_touchdown_supervision_and_guidance_reward() -> None:
         _observations((1.0, 1.0), (0.0, 0.0)), actions
     )
     torch.testing.assert_close(reward, torch.tensor([0.25 * 0.02]))
+
+
+def test_unstable_touchdown_is_filtered_until_stable_support() -> None:
+    foothold = ImaginedFoothold(
+        num_states=3,
+        num_actions=2,
+        num_envs=1,
+        state_group="state",
+        terrain_group="terrain",
+        geometry_group="geometry",
+        map_size=(0.2, 0.2),
+        map_resolution=0.1,
+        sole_size=(0.0, 0.0),
+        sole_resolution=0.1,
+        replay_capacity=8,
+        batch_size=1,
+        updates_per_iteration=1,
+        max_pending_steps=3,
+        train_min_samples=1,
+        stable_contact_max_deficiency=0.25,
+    )
+    actions = torch.zeros(1, 2)
+
+    foothold.observe_action(_observations((0.0, 1.0), (0.0, 0.0)), actions)
+    foothold.process_step(
+        _observations(
+            (1.0, 1.0),
+            (1.0, 0.0),
+            valid=torch.zeros(1, 9),
+        ),
+        torch.zeros(1, dtype=torch.bool),
+    )
+    assert foothold.replay.size == 0
+
+    foothold.process_step(
+        _observations((1.0, 1.0), (0.0, 0.0)),
+        torch.zeros(1, dtype=torch.bool),
+    )
+    assert foothold.replay.size == 1
+    assert foothold.replay.feet[0].item() == 0
