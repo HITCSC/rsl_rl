@@ -78,6 +78,8 @@ class OnPolicyRunner:
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
+            amp_reward_sum = 0.0
+            amp_reward_count = 0
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -90,6 +92,11 @@ class OnPolicyRunner:
                         check_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Add AMP discriminator reward before storing the transition.
+                    rewards, amp_reward, _ = self.alg.add_amp_reward(obs, rewards)
+                    if amp_reward is not None:
+                        amp_reward_sum += amp_reward.mean().item()
+                        amp_reward_count += 1
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
@@ -122,6 +129,7 @@ class OnPolicyRunner:
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
+                amp_reward=amp_reward_sum / amp_reward_count if amp_reward_count > 0 else None,
             )
 
             # Save model

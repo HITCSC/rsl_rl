@@ -216,6 +216,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        amp_reward: float | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -258,6 +259,8 @@ class Logger:
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+            if amp_reward is not None:
+                self.writer.add_scalar("Episode_Reward/amp_reward", amp_reward, it)
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
@@ -303,6 +306,8 @@ class Logger:
             # Print losses
             for key, value in loss_dict.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+            if amp_reward is not None:
+                log_string += f"""{"Mean AMP reward:":>{pad}} {amp_reward:.4f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:

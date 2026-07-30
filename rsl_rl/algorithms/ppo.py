@@ -14,7 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import MLP, EmpiricalNormalization
+from rsl_rl.modules import MLP, Discriminator, EmpiricalNormalization, ExpertLoader
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -60,6 +60,12 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Next-observation prediction auxiliary loss
         next_obs_prediction_cfg: dict | None = None,
+        # AMP discriminator auxiliary loss
+        discriminator: Discriminator | None = None,
+        expert_loader: ExpertLoader | None = None,
+        discriminator_obs_groups: list[str] | tuple[str, ...] | None = None,
+        amploss_coef: float = 1.0,
+        amp_grad_penalty_lambda: float = 10.0,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -105,6 +111,20 @@ class PPO:
         if next_obs_prediction_cfg is not None:
             self._init_next_obs_prediction(next_obs_prediction_cfg)
 
+        # AMP discriminator auxiliary loss
+        self.discriminator = discriminator.to(self.device) if discriminator is not None else None
+        self.expert_loader = expert_loader
+        self.amploss_coef = amploss_coef
+        self.amp_grad_penalty_lambda = amp_grad_penalty_lambda
+        self.discriminator_obs_groups = list(discriminator_obs_groups) if discriminator_obs_groups is not None else None
+        if self.discriminator is not None:
+            if self.expert_loader is None:
+                raise ValueError("AMP discriminator training requires expert_loader.")
+            if self.discriminator_obs_groups is None:
+                raise ValueError("AMP discriminator training requires discriminator_obs_groups.")
+            if actor.is_recurrent or critic.is_recurrent:
+                raise ValueError("AMP discriminator training is not supported for recurrent policies.")
+
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic``.
         self._raw_actor = self.actor
@@ -116,6 +136,7 @@ class PPO:
             for parameter in chain(
                 self.actor.parameters(),
                 self.critic.parameters(),
+                self.discriminator.parameters() if self.discriminator is not None else (),
                 self.next_obs_predictor.parameters() if self.next_obs_predictor is not None else (),
             )
             if parameter.requires_grad
@@ -206,6 +227,22 @@ class PPO:
         self.actor.reset(dones)
         self.critic.reset(dones)
 
+    def add_amp_reward(
+        self, next_obs: TensorDict, rewards: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Add discriminator AMP reward to the task reward during rollout collection."""
+        if self.discriminator is None:
+            return rewards, None, None
+        if self.transition.observations is None:
+            raise RuntimeError("AMP reward requires transition.observations recorded by act() before env.step().")
+
+        state = self._get_discriminator_state(self.transition.observations)
+        next_state = self._get_discriminator_state(next_obs)
+        amp_transition = torch.cat((state, next_state), dim=-1)
+        _, amp_reward, discriminator_pred = self.discriminator.predict_amp_reward(amp_transition)
+        amp_reward_for_add = self._match_reward_shape(amp_reward, rewards)
+        return rewards + amp_reward_for_add, amp_reward, discriminator_pred
+
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions."""
         st = self.storage
@@ -229,8 +266,9 @@ class PPO:
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
-        if self.next_obs_groups is not None:
-            self._rollout_final_obs = obs.select(*self.next_obs_groups)
+        final_obs_groups = self._final_obs_groups()
+        if final_obs_groups:
+            self._rollout_final_obs = obs.select(*final_obs_groups)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -238,6 +276,10 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_next_obs_loss = 0 if self.next_obs_predictor is not None else None
+        mean_amp_loss = 0 if self.discriminator is not None else None
+        mean_grad_pen_loss = 0 if self.discriminator is not None else None
+        mean_policy_pred = 0 if self.discriminator is not None else None
+        mean_expert_pred = 0 if self.discriminator is not None else None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -247,10 +289,12 @@ class PPO:
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
+            next_obs_specs = self._next_obs_specs()
             generator = self.storage.mini_batch_generator(
                 self.num_mini_batches,
                 self.num_learning_epochs,
                 next_obs_groups=self.next_obs_groups,
+                next_obs_specs=next_obs_specs,
                 final_obs=self._rollout_final_obs,
             )
 
@@ -361,6 +405,12 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
+            # AMP discriminator loss
+            discriminator_loss = self._compute_discriminator_loss(batch, original_batch_size)
+            if discriminator_loss is not None:
+                amp_loss, grad_pen_loss, policy_d, expert_d, policy_transition, expert_transition = discriminator_loss
+                loss = loss + self.amploss_coef * (amp_loss + grad_pen_loss)
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -376,6 +426,8 @@ class PPO:
             # Apply the gradients for PPO
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            if self.discriminator is not None:
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
@@ -393,6 +445,16 @@ class PPO:
                 mean_symmetry_loss += symmetry_loss.item()
             if mean_next_obs_loss is not None:
                 mean_next_obs_loss += next_obs_loss.item()
+            if mean_amp_loss is not None:
+                mean_amp_loss += amp_loss.item()
+                mean_grad_pen_loss += grad_pen_loss.item()
+                mean_policy_pred += policy_d.mean().item()
+                mean_expert_pred += expert_d.mean().item()
+
+                normalizer = getattr(self.discriminator, "discriminator_obs_normalizer", None)
+                if normalizer is not None and hasattr(normalizer, "update"):
+                    normalizer.update(policy_transition.detach().cpu().numpy())
+                    normalizer.update(expert_transition.detach().cpu().numpy())
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -405,6 +467,11 @@ class PPO:
             mean_symmetry_loss /= num_updates
         if mean_next_obs_loss is not None:
             mean_next_obs_loss /= num_updates
+        if mean_amp_loss is not None:
+            mean_amp_loss /= num_updates
+            mean_grad_pen_loss /= num_updates
+            mean_policy_pred /= num_updates
+            mean_expert_pred /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -418,6 +485,11 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if self.next_obs_predictor is not None:
             loss_dict["next_obs_prediction"] = mean_next_obs_loss
+        if self.discriminator is not None:
+            loss_dict["amp"] = mean_amp_loss
+            loss_dict["amp_grad_pen"] = mean_grad_pen_loss
+            loss_dict["amp_policy_pred"] = mean_policy_pred
+            loss_dict["amp_expert_pred"] = mean_expert_pred
 
         # Clear the storage
         self.storage.clear()
@@ -435,6 +507,8 @@ class PPO:
             self.next_obs_predictor.train()
         if self.next_obs_target_normalizer is not None:
             self.next_obs_target_normalizer.train()
+        if self.discriminator:
+            self.discriminator.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -446,6 +520,8 @@ class PPO:
             self.next_obs_predictor.eval()
         if self.next_obs_target_normalizer is not None:
             self.next_obs_target_normalizer.eval()
+        if self.discriminator:
+            self.discriminator.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -461,6 +537,8 @@ class PPO:
             saved_dict["next_obs_predictor_state_dict"] = self.next_obs_predictor.state_dict()
             if self.next_obs_target_normalizer is not None:
                 saved_dict["next_obs_target_normalizer_state_dict"] = self.next_obs_target_normalizer.state_dict()
+        if self.discriminator is not None:
+            saved_dict["discriminator_state_dict"] = self.discriminator.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -474,6 +552,7 @@ class PPO:
                 "iteration": True,
                 "rnd": True,
                 "next_obs_prediction": True,
+                "discriminator": True,
             }
 
         # Load the specified models
@@ -485,12 +564,20 @@ class PPO:
             try:
                 self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             except ValueError:
-                if self.next_obs_predictor is None or "next_obs_predictor_state_dict" in loaded_dict:
-                    raise
-                print(
-                    "Skipping optimizer state load because the checkpoint predates "
-                    "next-observation prediction."
+                predates_next_obs_prediction = (
+                    self.next_obs_predictor is not None and "next_obs_predictor_state_dict" not in loaded_dict
                 )
+                predates_discriminator = (
+                    self.discriminator is not None and "discriminator_state_dict" not in loaded_dict
+                )
+                if not predates_next_obs_prediction and not predates_discriminator:
+                    raise
+                missing = []
+                if predates_next_obs_prediction:
+                    missing.append("next-observation prediction")
+                if predates_discriminator:
+                    missing.append("AMP discriminator")
+                print(f"Skipping optimizer state load because the checkpoint predates {', '.join(missing)}.")
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -508,6 +595,8 @@ class PPO:
                     loaded_dict["next_obs_target_normalizer_state_dict"],
                     strict=strict,
                 )
+        if load_cfg.get("discriminator") and self.discriminator and "discriminator_state_dict" in loaded_dict:
+            self.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=strict)
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -556,8 +645,49 @@ class PPO:
         # Initialize the storage
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
+        # Initialize the optional AMP discriminator and expert transition loader
+        discriminator = None
+        expert_loader = None
+        discriminator_cfg = cfg["algorithm"].pop("discriminator_cfg", None)
+        expert_loader_cfg = cfg["algorithm"].pop("expert_loader_cfg", None)
+        discriminator_obs_groups = cfg["algorithm"].pop("discriminator_obs_groups", None)
+        if discriminator_cfg is not None:
+            if discriminator_obs_groups is None:
+                raise ValueError("algorithm.discriminator_obs_groups is required when discriminator_cfg is set.")
+            discriminator_cfg = dict(discriminator_cfg)
+            discriminator_class = resolve_callable(discriminator_cfg.pop("class_name", "Discriminator"))
+            discriminator = discriminator_class(
+                obs=obs,
+                obs_groups={"discriminator": list(discriminator_obs_groups)},
+                device=device,
+                **discriminator_cfg,
+            )
+
+            if expert_loader_cfg is None:
+                raise ValueError("algorithm.expert_loader_cfg is required when discriminator_cfg is set.")
+            expert_loader_cfg = dict(expert_loader_cfg)
+            expert_loader_class = resolve_callable(expert_loader_cfg.pop("class_name", "ExpertLoader"))
+            paths = expert_loader_cfg.pop("paths", expert_loader_cfg.pop("amp_motion_files", None))
+            if paths is None:
+                raise ValueError("expert_loader_cfg requires 'paths' or 'amp_motion_files'.")
+            batch_size = expert_loader_cfg.pop(
+                "batch_size",
+                env.num_envs * cfg["num_steps_per_env"] // cfg["algorithm"]["num_mini_batches"],
+            )
+            expert_loader = expert_loader_class.from_npz(paths, batch_size=batch_size, device=device, **expert_loader_cfg)
+
         # Initialize the algorithm
-        alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPO = alg_class(
+            actor,
+            critic,
+            storage,
+            device=device,
+            discriminator=discriminator,
+            expert_loader=expert_loader,
+            discriminator_obs_groups=discriminator_obs_groups,
+            **cfg["algorithm"],
+            multi_gpu_cfg=cfg["multi_gpu"],
+        )
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
@@ -572,15 +702,22 @@ class PPO:
             model_params.append(self.rnd.predictor.state_dict())
         if self.next_obs_predictor is not None:
             model_params.append(self.next_obs_predictor.state_dict())
+        if self.discriminator is not None:
+            model_params.append(self.discriminator.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
         self._raw_actor.load_state_dict(model_params[0])
         self._raw_critic.load_state_dict(model_params[1])
+        model_param_idx = 2
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
+            self.rnd.predictor.load_state_dict(model_params[model_param_idx])
+            model_param_idx += 1
         if self.next_obs_predictor is not None:
-            self.next_obs_predictor.load_state_dict(model_params[-1])
+            self.next_obs_predictor.load_state_dict(model_params[model_param_idx])
+            model_param_idx += 1
+        if self.discriminator is not None:
+            self.discriminator.load_state_dict(model_params[model_param_idx])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -589,6 +726,8 @@ class PPO:
         """
         # Create a tensor to store the gradients
         all_params = chain(self.actor.parameters(), self.critic.parameters())
+        if self.discriminator is not None:
+            all_params = chain(all_params, self.discriminator.parameters())
         if self.next_obs_predictor is not None:
             all_params = chain(all_params, self.next_obs_predictor.parameters())
         if self.rnd:
@@ -608,6 +747,72 @@ class PPO:
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
                 offset += numel
+
+    def _final_obs_groups(self) -> list[str]:
+        """Return all observation groups that need final rollout observations for next-state targets."""
+        groups = []
+        if self.next_obs_groups is not None:
+            groups.extend(self.next_obs_groups)
+        if self.discriminator is not None:
+            groups.extend(self.discriminator_obs_groups)
+        return list(dict.fromkeys(groups))
+
+    def _next_obs_specs(self) -> dict[str, list[str]] | None:
+        """Return next-observation target specs needed in rollout mini-batches."""
+        if self.discriminator is None:
+            return None
+        assert self.discriminator_obs_groups is not None
+        return {"amp": self.discriminator_obs_groups}
+
+    def _get_discriminator_state(self, observations: TensorDict) -> torch.Tensor:
+        """Build state ``s = concat(q, dot_q, eef_pos)`` from mjlab TensorDict observations."""
+        state_parts = []
+        for group in self.discriminator_obs_groups:
+            if group not in observations:
+                raise KeyError(f"Discriminator observation group '{group}' is not in observations.")
+            state_parts.append(observations[group].reshape(observations[group].shape[0], -1))
+        return torch.cat(state_parts, dim=-1)
+
+    def _match_reward_shape(self, reward: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        """Reshape a per-env reward tensor to match the environment reward shape."""
+        if reward.shape == reference.shape:
+            return reward
+        if reward.numel() == reference.numel():
+            return reward.reshape(reference.shape)
+        while reward.dim() < reference.dim():
+            reward = reward.unsqueeze(-1)
+        return reward
+
+    def _sample_expert_amp(self, batch_size: int) -> torch.Tensor:
+        """Sample expert AMP transitions from the configured expert loader."""
+        assert self.expert_loader is not None
+        return self.expert_loader.dataset.sample_amp(batch_size).to(self.device)
+
+    def _compute_discriminator_loss(
+        self,
+        batch: RolloutStorage.Batch,
+        original_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Compute AMP discriminator loss for policy and expert state transitions."""
+        if self.discriminator is None:
+            return None
+        if batch.extra is None or "amp" not in batch.extra:
+            raise RuntimeError("AMP discriminator loss requires next-state targets in batch.extra['amp'].")
+
+        policy_state = self._get_discriminator_state(batch.observations[:original_batch_size])  # type: ignore[index]
+        policy_next_state = batch.extra["amp", "target"][:original_batch_size]
+        policy_transition = torch.cat((policy_state, policy_next_state), dim=-1)
+
+        expert_transition = self._sample_expert_amp(policy_transition.shape[0])
+        expert_transition = expert_transition.to(dtype=policy_transition.dtype)
+
+        policy_d = self.discriminator(policy_transition)
+        expert_d = self.discriminator(expert_transition)
+        expert_loss = (expert_d - 1).pow(2).mean()
+        policy_loss = (policy_d + 1).pow(2).mean()
+        amp_loss = 0.5 * (expert_loss + policy_loss)
+        grad_pen_loss = self.discriminator.compute_grad_pen(expert_transition, lambda_=self.amp_grad_penalty_lambda)
+        return amp_loss, grad_pen_loss, policy_d, expert_d, policy_transition, expert_transition
 
     def _init_next_obs_prediction(self, cfg: dict) -> None:
         """Initialize the optional next-observation prediction auxiliary head."""

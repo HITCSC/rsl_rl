@@ -234,13 +234,19 @@ class RolloutStorage:
         num_mini_batches: int,
         num_epochs: int = 8,
         next_obs_groups: list[str] | None = None,
+        next_obs_specs: dict[str, list[str]] | None = None,
         final_obs: TensorDict | None = None,
     ) -> Generator[Batch, None, None]:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        if next_obs_groups is not None:
+            next_obs_specs = dict(next_obs_specs or {})
+            next_obs_specs["next_obs_prediction"] = next_obs_groups
         if next_obs_groups is not None and final_obs is None:
             raise ValueError("final_obs must be provided when next_obs_groups is set.")
+        if next_obs_specs is not None and final_obs is None:
+            raise ValueError("final_obs must be provided when next_obs_specs is set.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
@@ -263,8 +269,9 @@ class RolloutStorage:
                 stop = (i + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
                 batch_extra = extra[batch_idx] if extra is not None else None
-                if next_obs_groups is not None:
-                    batch_extra = self._add_next_obs_prediction_extra(batch_idx, batch_extra, next_obs_groups, final_obs)  # type: ignore[arg-type]
+                if next_obs_specs is not None:
+                    for extra_key, groups in next_obs_specs.items():
+                        batch_extra = self._add_next_obs_extra(batch_idx, batch_extra, groups, final_obs, extra_key)  # type: ignore[arg-type]
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
@@ -413,6 +420,17 @@ class RolloutStorage:
         final_obs: TensorDict,
     ) -> TensorDict:
         """Add lazily materialized next-observation prediction targets to a mini-batch extra dict."""
+        return self._add_next_obs_extra(batch_idx, extra, next_obs_groups, final_obs, "next_obs_prediction")
+
+    def _add_next_obs_extra(
+        self,
+        batch_idx: torch.Tensor,
+        extra: TensorDict | None,
+        next_obs_groups: list[str],
+        final_obs: TensorDict,
+        extra_key: str,
+    ) -> TensorDict:
+        """Add lazily materialized next-observation targets to a mini-batch extra dict."""
         step_idx = batch_idx // self.num_envs
         env_idx = batch_idx % self.num_envs
         last_step = step_idx == self.num_transitions_per_env - 1
@@ -435,7 +453,7 @@ class RolloutStorage:
 
         if extra is None:
             extra = TensorDict({}, batch_size=[batch_idx.shape[0]], device=self.device)
-        extra["next_obs_prediction"] = TensorDict(
+        extra[extra_key] = TensorDict(
             {"target": target},
             batch_size=[batch_idx.shape[0]],
             device=self.device,

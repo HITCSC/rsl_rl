@@ -6,6 +6,7 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
+from .discriminator import Discriminator, ExpertLoader, Normalizer, NpzStateTransitionDataset, RunningMeanStd
 from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
@@ -13,8 +14,13 @@ from .rnn import RNN, HiddenState
 
 __all__ = [
     "CNN",
+    "Discriminator",
+    "ExpertLoader",
     "MLP",
+    "Normalizer",
+    "NpzStateTransitionDataset",
     "RNN",
+    "RunningMeanStd",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
