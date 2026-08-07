@@ -5,6 +5,7 @@
 
 """Neural models for the learning algorithm."""
 
+from .ame_model import AMEModel
 from .cnn_model import CNNModel
 from .defm_model import DefmModel
 from .emp_teacher_model import EMPTeacherModel
@@ -14,6 +15,7 @@ from .rnn_model import RNNModel
 from .ssr_model import SSRModel
 
 __all__ = [
+    "AMEModel",
     "CNNModel",
     "DefmModel",
     "EMPTeacherModel",
