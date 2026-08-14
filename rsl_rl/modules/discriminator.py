@@ -170,6 +170,7 @@ class NpzStateTransitionDataset:
         eef_body_names: Sequence[str] = DEFAULT_EEF_BODY_NAMES,
         root_body_name: str = "base_link",
         dof_names: Sequence[str] | None = None,
+        dof_pos_offsets: Sequence[float] | None = None,
     ) -> None:
         if isinstance(paths, (str, Path)):
             paths = [paths]
@@ -178,6 +179,7 @@ class NpzStateTransitionDataset:
         self.eef_body_names = tuple(eef_body_names)
         self.root_body_name = root_body_name
         self.dof_names = tuple(dof_names) if dof_names is not None else None
+        self.dof_pos_offsets = None if dof_pos_offsets is None else np.asarray(dof_pos_offsets, dtype=np.float32)
         states = self._load_data(self.paths)
         self.state_dim = states[0].shape[-1]
         self.transitions = torch.cat([torch.cat((state[:-1], state[1:]), dim=-1) for state in states], dim=0)
@@ -212,6 +214,7 @@ class NpzStateTransitionDataset:
         q = np.asarray(data["dof_positions"])
         dot_q = np.asarray(data["dof_velocities"])
         q, dot_q = self._select_dofs(q, dot_q, data, path)
+        q = self._apply_dof_pos_offsets(q, path)
 
         body_positions = np.asarray(data["body_positions"])
         body_names = [str(name) for name in np.asarray(data["body_names"]).tolist()]
@@ -241,6 +244,16 @@ class NpzStateTransitionDataset:
         except ValueError as exc:
             raise KeyError(f"{exc} in {path}. Available dof_names: {names}") from exc
         return q[:, indices], dot_q[:, indices]
+
+    def _apply_dof_pos_offsets(self, q: np.ndarray, path: Path) -> np.ndarray:
+        if self.dof_pos_offsets is None:
+            return q
+        if self.dof_pos_offsets.shape != (q.shape[1],):
+            raise ValueError(
+                f"dof_pos_offsets for {path} must have shape ({q.shape[1]},), "
+                f"got {self.dof_pos_offsets.shape}."
+            )
+        return q - self.dof_pos_offsets.reshape(1, -1)
 
     def _make_state(self, q: np.ndarray, dot_q: np.ndarray, eef_pos: np.ndarray, path: Path, prefix: str) -> np.ndarray:
         arrays = [self._flatten_time_array(arr) for arr in (q, dot_q, eef_pos)]
